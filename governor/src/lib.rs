@@ -78,6 +78,8 @@ pub enum GovernorError {
     AlreadyExecuted = 13,
     ProposalCanceled = 14,
     SelfTargetForbidden = 15,
+    VoteTallyOverflow = 16,
+    DeadlineOverflow = 17,
 }
 
 #[contracttype]
@@ -155,7 +157,7 @@ impl Governor {
         let proposal = Proposal {
             proposer,
             snapshot,
-            deadline: snapshot + config.voting_delay + config.voting_period,
+            deadline: Self::deadline(&env, snapshot, &config)?,
             eta: 0,
             for_votes: 0,
             against_votes: 0,
@@ -187,7 +189,11 @@ impl Governor {
             return Err(GovernorError::ProposalCanceled);
         }
         let now = env.ledger().sequence();
-        if now < proposal.snapshot + config.voting_delay {
+        let voting_start = proposal
+            .snapshot
+            .checked_add(config.voting_delay)
+            .ok_or(GovernorError::DeadlineOverflow)?;
+        if now < voting_start {
             return Err(GovernorError::NotActive);
         }
         if now > proposal.deadline {
@@ -205,9 +211,24 @@ impl Governor {
         }
 
         match support {
-            VoteType::For => proposal.for_votes += power,
-            VoteType::Against => proposal.against_votes += power,
-            VoteType::Abstain => proposal.abstain_votes += power,
+            VoteType::For => {
+                proposal.for_votes = proposal
+                    .for_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
+            VoteType::Against => {
+                proposal.against_votes = proposal
+                    .against_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
+            VoteType::Abstain => {
+                proposal.abstain_votes = proposal
+                    .abstain_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
         }
         env.storage().persistent().set(&vote_key, &power);
         env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
@@ -242,17 +263,6 @@ impl Governor {
         proposal.executed = true;
         env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
         // The timelock performs the actual call; the governor only records the
-        // transition so state stays consistent with the timelock's execution.
-        let _ = config.timelock;
-        Ok(())
-    }
+        // transition so state stays consistent with the timelock
 
-    pub fn state(env: Env, proposal_id: u32) -> Result<ProposalState, GovernorError> {
-        let config = Self::config(&env)?;
-        let proposal = Self::proposal(&env, proposal_id)?;
-        Ok(Self::state_of(&env, &config, &proposal))
-    }
-
-    pub fn proposal(env: Env, proposal_id: u32) -> Result<Proposal, Gove
-
-/* … truncated 3459 chars — edit only what you need near the top … */
+/* … truncated 461 chars — edit only what you need near the top … */
