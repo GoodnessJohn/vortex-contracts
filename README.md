@@ -625,3 +625,6 @@ Current ecosystem tooling examples:
 - #400: [High] Add an interface-version handshake between cooperating contracts
 <!-- handsoff-issue-404 -->
 - #404: [High] Add on-chain rate-of-change guardrails to protocol parameters
+
+<!-- handsoff-issue-562 -->
+- #562: [High] Issue #342 was closed by a commit whose own message admits the fix was deferred, not completed — a direct, documented instance of fake issue closure
