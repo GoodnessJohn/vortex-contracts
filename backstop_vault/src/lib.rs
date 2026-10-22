@@ -38,13 +38,25 @@ use soroban_sdk::{
 const VIRTUAL_SHARES: i128 = 1_000_000_000; // 100 USDC-equivalent at 1:1
 const VIRTUAL_ASSETS: i128 = 1_000_000_000;
 
-/// Minimum deposit (1 USDC in 7-decimal units).
+/// Default minimum deposit (1 USDC in 7-decimal units). Used to seed the
+/// admin-configurable config in `initialize` and as a fallback if unset.
 const MIN_DEPOSIT: i128 = 10_000_000;
 
-/// Withdrawal cooldown in seconds. An LP who just deposited must wait this
-/// long before they can withdraw, preventing deposit front-running ahead of
-/// a known incoming fee or slash payment.
+/// Default withdrawal cooldown in seconds. An LP who just deposited must wait
+/// this long before they can withdraw, preventing deposit front-running ahead
+/// of a known incoming fee or slash payment. Used to seed the config and as a
+/// fallback if unset.
 const WITHDRAWAL_COOLDOWN_SECS: u64 = 172_800; // 48 hours
+
+/// Lower bound for the configurable minimum deposit (1 USDC in 7-decimal units).
+const MIN_DEPOSIT_FLOOR: i128 = 10_000_000;
+/// Upper bound for the configurable minimum deposit (1,000,000 USDC).
+const MIN_DEPOSIT_CEILING: i128 = 10_000_000_000_000;
+
+/// Lower bound for the configurable withdrawal cooldown (1 hour).
+const WITHDRAWAL_COOLDOWN_SECS_MIN: u64 = 3_600;
+/// Upper bound for the configurable withdrawal cooldown (30 days).
+const WITHDRAWAL_COOLDOWN_SECS_MAX: u64 = 2_592_000;
 
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5 s per ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14;
@@ -82,6 +94,21 @@ pub enum DataKey {
     TotalCoverPaid,
     /// Cumulative income received (fees + slashes) (i128).
     TotalIncome,
+    /// Admin-configurable vault configuration (`BackstopConfig`).
+    Config,
+}
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+/// Admin-configurable vault parameters (issue #543, following the
+/// `ProtocolConfig`/`set_config` precedent from `intent_settlement` #52).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackstopConfig {
+    /// Minimum deposit amount (in bond-token units).
+    pub min_deposit: i128,
+    /// Withdrawal cooldown in seconds applied after a deposit.
+    pub withdrawal_cooldown_secs: u64,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -101,6 +128,7 @@ pub enum Error {
     EmergencyModeActive = 9,
     EmergencyModeNotActive = 10,
     NothingQueued = 11,
+    InvalidConfig = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -134,6 +162,15 @@ impl BackstopVault {
         env.storage().instance().set(&DataKey::TotalIncome, &0i128);
         env.storage().instance().set(&DataKey::TotalQueued, &0i128);
         env.storage().instance().set(&DataKey::EmergencyMode, &false);
+        // Seed the admin-configurable config with the default constants so
+        // behavior is unchanged until an admin updates it.
+        env.storage().instance().set(
+            &DataKey::Config,
+            &BackstopConfig {
+                min_deposit: MIN_DEPOSIT,
+                withdrawal_cooldown_secs: WITHDRAWAL_COOLDOWN_SECS,
+            },
+        );
         Self::bump_instance_ttl(&env);
     }
 
@@ -150,7 +187,8 @@ impl BackstopVault {
         lp.require_auth();
         Self::bump_instance_ttl(&env);
 
-        if amount < MIN_DEPOSIT {
+        let config = Self::load_config(&env);
+        if amount < config.min_deposit {
             panic_with_error!(&env, Error::BelowMinDeposit);
         }
 
@@ -189,7 +227,7 @@ impl BackstopVault {
         Self::bump_persistent_ttl(&env, &DataKey::Shares(lp.clone()));
 
         // Reset cooldown: fresh deposit starts a new window.
-        let cooldown_until = env.ledger().timestamp() + WITHDRAWAL_COOLDOWN_SECS;
+        let cooldown_until = env.ledger().timestamp() + config.withdrawal_cooldown_secs;
         env.storage()
             .persistent()
             .set(&DataKey::WithdrawCooldown(lp.clone()), &cooldown_until);
@@ -465,7 +503,42 @@ impl BackstopVault {
             .publish((Symbol::new(&env, "emergency_mode"),), enabled);
     }
 
+    /// Admin-only: update the vault configuration (`min_deposit` and
+    /// `withdrawal_cooldown_secs`). Validates sane bounds and rejects
+    /// out-of-range values with `Error::InvalidConfig`.
+    pub fn set_config(env: Env, min_deposit: i128, withdrawal_cooldown_secs: u64) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        Self::bump_instance_ttl(&env);
+
+        if min_deposit < MIN_DEPOSIT_FLOOR || min_deposit > MIN_DEPOSIT_CEILING {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+        if withdrawal_cooldown_secs < WITHDRAWAL_COOLDOWN_SECS_MIN
+            || withdrawal_cooldown_secs > WITHDRAWAL_COOLDOWN_SECS_MAX
+        {
+            panic_with_error!(&env, Error::InvalidConfig);
+        }
+
+        let config = BackstopConfig {
+            min_deposit,
+            withdrawal_cooldown_secs,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events()
+            .publish((Symbol::new(&env, "config_updated"),), config);
+    }
+
     // ── Views ──────────────────────────────────────────────────────────────────
+
+    /// Returns the current admin-configurable vault configuration.
+    pub fn get_config(env: Env) -> BackstopConfig {
+        Self::load_config(&env)
+    }
 
     /// Returns (total_assets, total_shares, assets_per_share_in_bps).
     /// `assets_per_share_in_bps = total_assets * 10_000 / total_shares`
@@ -510,6 +583,16 @@ impl BackstopVault {
             .instance()
             .get(&DataKey::TotalShares)
             .unwrap_or(VIRTUAL_SHARES)
+    }
+
+    fn load_config(env: &Env) -> BackstopConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(BackstopConfig {
+                min_deposit: MIN_DEPOSIT,
+                withdrawal_cooldown_secs: WITHDRAWAL_COOLDOWN_SECS,
+            })
     }
 
     fn bump_instance_ttl(env: &Env) {

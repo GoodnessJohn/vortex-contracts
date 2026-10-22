@@ -29,6 +29,7 @@ on:
 #
 # Per-job audit (all trigger types, checked 2026-08-31):
 #   fmt           — checkout only                    → contents: read  ✓
+#   cargo-check   — checkout, cargo check            → contents: read  ✓
 #   contract      — checkout, clippy, test           → contents: read  ✓
 #   wasm-size     — checkout, build, STEP_SUMMARY    → contents: read  ✓
 #   proptest      — checkout, cargo test             → contents: read  ✓
@@ -116,6 +117,44 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # ── Compile gate ────────────────────────────────────────────────────────────
+  #
+  # Regression guard for issue #557: `proof_registry` (and therefore
+  # `intent_settlement`, which path-depends on it) once failed to compile while
+  # CI appeared green.  This job runs a plain `cargo check --all-targets` for
+  # every workspace member crate, with no caching and no feature/toolchain
+  # matrix, so a compile error can never be masked by a stale `rust-cache`
+  # entry or by a different toolchain resolving differently than locally.
+  #
+  # This job is intended to be a *required* status check on `main`.
+  cargo-check:
+    name: cargo check (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - intent_settlement
+          - proof_registry
+          - solver_registry
+          - backstop_vault
+          - reputation_badge
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Deliberately NO Swatinem/rust-cache here.  A stale cache was one of the
+      # suspected reasons the breakage in #557 went unnoticed; a cold build is
+      # slower but cannot produce a false green.
+      - name: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
   contract:
     name: Contract (${{ matrix.crate }} / ${{ matrix.toolchain }})

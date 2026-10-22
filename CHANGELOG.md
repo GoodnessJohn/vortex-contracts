@@ -37,6 +37,21 @@ first deploys to mainnet.
 
 ### Changed
 
+- **Duplicated escrow/dispute entrypoints merged (issue #98, #342).**
+  `begin_fill`, `release_fill`, and `resolve_dispute` were each defined twice
+  in `intent_settlement/src/lib.rs` (two complete, parallel, never-merged
+  implementations left behind by a bad merge), and dispute opening existed as
+  two separate entrypoints — `open_dispute` and `dispute_fill` — that differed
+  on whether a `DISPUTE_BOND` is required. Each pair is now collapsed into a
+  single implementation, and dispute opening is a single coherent path:
+  `dispute_fill` is the sole dispute-opening entrypoint and requires the
+  `DISPUTE_BOND` (anti-griefing: a user cannot freeze a solver's escrowed fill
+  for the full `DISPUTE_WINDOW` for free, and the bond is returned on an
+  `Upheld` ruling / forfeited to the solver on a `Dismissed` one). The
+  bond-free `open_dispute` variant is removed. The surviving implementations
+  are the later-indexed (newer design iteration) bodies, verified
+  function-by-function against their doc comments; the merged dispute suite
+  covers both previously-divergent paths.
 - **Storage layout — `SolverRecord` / `IntentRecord` (issue #187, #188).**
   `SolverRecord` gains a `bond_tokens: Vec<Address>` field enumerating every
   approved token a solver holds a bond in; `bond_amount` is retained as the
@@ -89,6 +104,10 @@ first deploys to mainnet.
 
 ### Fixed
 
+- **`proof_registry` compile failure (issue #97).** `proof_registry` did not
+  type-check, which blocked `intent_settlement` (and its dispute-resolution
+  suite) from being compiled at all; the crate now builds cleanly, unblocking
+  the entrypoint merge above.
 - **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
   not build — `lib.rs` referenced ~12 undeclared constants, 9 undeclared
   `DataKey` variants and 6 undeclared `Error` variants, the `Error` enum had
