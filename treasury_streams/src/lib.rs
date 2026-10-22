@@ -205,7 +205,7 @@ impl TreasuryStreams {
     /// Precision-safe vested amount: `total * elapsed / duration` using integer
     /// math. The final withdrawal sweeps any rounding dust because once
     /// `now >= end` the full `total` is considered vested.
-    fn vested_amount(stream: &Stream, now: u64) -> i128 {
+    pub(crate) fn vested_amount(stream: &Stream, now: u64) -> i128 {
         if now < stream.cliff {
             return 0;
         }
