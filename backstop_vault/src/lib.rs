@@ -31,6 +31,10 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token,
     Address, BytesN, Env, Symbol,
 };
+use vortex_common::{
+    require_admin, CommonError, INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD,
+    PERSISTENT_TTL_EXTEND_TO, PERSISTENT_TTL_THRESHOLD,
+};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -46,11 +50,9 @@ const MIN_DEPOSIT: i128 = 10_000_000;
 /// a known incoming fee or slash payment.
 const WITHDRAWAL_COOLDOWN_SECS: u64 = 172_800; // 48 hours
 
-const DAY_IN_LEDGERS: u32 = 17_280; // ~5 s per ledger
-const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14;
-const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
-const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
-const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
+// TTL constants (`PERSISTENT_TTL_THRESHOLD`, `PERSISTENT_TTL_EXTEND_TO`,
+// `INSTANCE_TTL_THRESHOLD`, `INSTANCE_TTL_EXTEND_TO`) are imported from
+// `vortex_common` so every contract shares one definition.
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -457,7 +459,9 @@ impl BackstopVault {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        admin.require_auth();
+        if let Err(CommonError::Unauthorized) = require_admin(&env, &admin) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         env.storage()
             .instance()
             .set(&DataKey::EmergencyMode, &enabled);

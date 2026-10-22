@@ -19,7 +19,7 @@ This document consolidates forward-looking work, deferred features, and known li
 
 | Item | Status | Details | Issue(s) |
 |------|--------|---------|----------|
-| Proof Registry contract & interface | 🎯 Not Started | Contract to store and serve verified Wormhole VAAs; on-chain reference for `fill_intent(require_proof=true)` | #190, #124 |
+| Proof Registry contract & interface | ✅ Shipped | `proof_registry` crate stores and serves verified Wormhole VAAs; on-chain reference for `fill_intent(require_proof=true)` | #190, #124 |
 | Proof verification integration with `fill_intent` | 🔄 In Progress | Optional on-chain gate: `fill_intent(..., require_proof=true)` checks the `ProofRegistry` before allowing a fill | #190 |
 | Proof mismatch fallback & recovery | 🔄 In Progress | Handling for edge cases: proof arrives late, is invalid, or conflicts with a fill | #129 |
 | Cross-chain oracle pricing (cross-token value comparison) | 🔍 Under Research | Currently slash amounts assume same-token or admin-set minimums; a price oracle would enable true cross-token comparisons | SECURITY.md, #193 |
@@ -37,7 +37,7 @@ This document consolidates forward-looking work, deferred features, and known li
 |------|--------|---------|----------|
 | Solver Registry contract & enumerable list | ✅ Shipped | On-chain registry with paginated `list_solvers(start, limit)` for real-time solver discovery | #13, #197 |
 | Solver reputation score computation | ✅ Shipped | `compute_reputation_score` based on fills completed, fills failed, and total volume | #41, #197 |
-| Reputation-tier badge (on-chain, score-derived) | 🎯 Not Started | NFT-style on-chain tier display (Unranked / Bronze / Silver / Gold / Platinum) based on reputation score | #57 |
+| Reputation-tier badge (on-chain, score-derived) | ✅ Shipped | `reputation_badge` crate: NFT-style on-chain tier display (Unranked / Bronze / Silver / Gold / Platinum) based on reputation score | #57, #242, #396, #397 |
 | Leaderboard & ranking tool (off-chain) | 🎯 Not Started | Public tool for sorting solvers by reputation, volume, and other signals; feeds tier-badge data | #41 |
 | Governance-weight formula | 🎯 Not Started | Define "reputation × bond" or similar weighting for community signaling; used by reputation-weighted governance tool | #41, #305 |
 | Off-chain reputation-weighted signaling tool | 🎯 Not Started | Tool for signed off-chain messages expressing community preference on governance proposals, weighted by governance-weight formula | #305 |

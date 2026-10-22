@@ -9,6 +9,8 @@ members = [
   "treasury_streams",
   "fee_router",
   "arbiter_panel",
+  "governor",
+  "backstop_vault",
 ]
 resolver = "2"
 

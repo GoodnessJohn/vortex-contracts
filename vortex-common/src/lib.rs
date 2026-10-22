@@ -7,6 +7,20 @@
 
 pub use soroban_sdk::{Address, Env};
 
+// ─── Common Error Type ───────────────────────────────────────────────────────
+// Issue #505: Named error type instead of `()` so callers can map directly.
+
+/// Shared error type for `vortex-common` helpers.
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CommonError {
+  /// The caller is not the stored admin.
+  Unauthorized = 1,
+  /// The admin key is absent from storage (contract not initialized).
+  NotInitialized = 2,
+}
+
 // ─── TTL Constants (Soroban Ledger Entry Lifecycle) ──────────────────────────
 // Issue #352: Unified TTL constants prevent divergence between contracts
 
@@ -67,10 +81,21 @@ pub trait AdminStorage {
 }
 
 /// Helper to assert the caller is admin.
-pub fn require_admin(env: &Env, admin_key: impl soroban_sdk::IntoVal<Env>, caller: &Address) -> Result<(), ()> {
-  let admin: Address = env.storage().instance().get(&admin_key).ok_or(())?;
+///
+/// Returns [`CommonError::NotInitialized`] if no admin is stored under
+/// `admin_key`, and [`CommonError::Unauthorized`] if `caller` is not the admin.
+pub fn require_admin(
+  env: &Env,
+  admin_key: impl soroban_sdk::IntoVal<Env>,
+  caller: &Address,
+) -> Result<(), CommonError> {
+  let admin: Address = env
+    .storage()
+    .instance()
+    .get(&admin_key)
+    .ok_or(CommonError::NotInitialized)?;
   if admin != *caller {
-    return Err(());
+    return Err(CommonError::Unauthorized);
   }
   Ok(())
 }
@@ -109,5 +134,36 @@ mod tests {
   fn test_ttl_constants() {
     assert!(PERSISTENT_TTL_THRESHOLD < PERSISTENT_TTL_EXTEND_TO);
     assert!(INSTANCE_TTL_THRESHOLD < INSTANCE_TTL_EXTEND_TO);
+  }
+
+  #[test]
+  fn test_common_error_values() {
+    assert_eq!(CommonError::Unauthorized as u32, 1);
+    assert_eq!(CommonError::NotInitialized as u32, 2);
+  }
+
+  #[test]
+  fn test_require_admin() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let other = Address::generate(&env);
+    let key = soroban_sdk::symbol_short!("admin");
+
+    // Missing admin key -> NotInitialized.
+    assert_eq!(
+      require_admin(&env, key.clone(), &admin),
+      Err(CommonError::NotInitialized)
+    );
+
+    env.storage().instance().set(&key, &admin);
+
+    // Matching caller -> Ok.
+    assert_eq!(require_admin(&env, key.clone(), &admin), Ok(()));
+
+    // Non-matching caller -> Unauthorized.
+    assert_eq!(
+      require_admin(&env, key, &other),
+      Err(CommonError::Unauthorized)
+    );
   }
 }
