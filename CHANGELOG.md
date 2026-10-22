@@ -11,6 +11,27 @@ first deploys to mainnet.
 
 ### Added
 
+- **`arbiter_panel` contract (issue #555).** m-of-n bonded arbiter panel
+  (register/deregister with bond, PRNG panel selection, `open_vote`/`vote`/`tally`,
+  slashing of dissenting/absent arbiters, `VOTE_WINDOW` timeout). `intent_settlement`
+  gains `set_arbiter_panel` (admin) and `dispute_parties`; `resolve_dispute` is
+  gated by the configured arbiter (the panel once set). `docs/dispute-resolution-design.md`
+  now states that the legacy admin-arbiter model applies until `set_arbiter_panel` is called.
+- **`directory` contract (issue #554).** On-chain address book for canonical protocol
+  addresses; see `docs/directory-design.md`.
+- **Oracle wiring (issue #549).** `intent_settlement` now compiles `oracle.rs`; cross-token
+  exposure in `accept_intent`/`fill_intent`/`slash_solver` is weighted by oracle prices,
+  falling back to a conservative 1.0× on stale/missing/zero prices or no oracle.
+  `OracleAdapterClient` calls use `try_` so a faulty oracle never blocks slashing.
+
+### Changed
+
+- **Intent id derivation (issue #565, ABI/storage-relevant).** `compute_intent_id` no longer
+  hashes the ledger timestamp; ids are now
+  `sha256("vortex-intent-v1" || contract_id || network_id || user || nonce || params_hash)`
+  so clients can precompute them. Ids differ from those produced by earlier builds. New views:
+  `get_user_nonce`, `preview_intent_id`.
+
 - **CI: Enforce CHANGELOG.md updates (issue #294).** A new CI job verifies that
   every PR changing `intent_settlement/src/` or `proof_registry/src/` includes a
   corresponding update to `CHANGELOG.md`. An escape hatch (`no-changelog-needed`

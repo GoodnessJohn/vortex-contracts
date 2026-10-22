@@ -3735,3 +3735,46 @@ fn partial_fill_reopen_clears_the_tier_snapshot() {
         "snapshot cleared on re-open"
     );
 }
+
+// #354 / #565 — the intent id is client-computable: it depends only on inputs
+// the client has before submission (no ledger timestamp).
+#[test]
+fn client_can_precompute_intent_id_without_timestamp() {
+    use soroban_sdk::{xdr::ToXdr, Bytes};
+    let ctx = setup();
+    let c = ctx.client();
+    let src_chain = String::from_str(&ctx.env, "ethereum");
+
+    // Independent "client-side" reference implementation of the documented scheme.
+    let reference = |nonce: u64| -> BytesN<32> {
+        let mut params = Bytes::new(&ctx.env);
+        params.append(&src_chain.clone().to_xdr(&ctx.env));
+        params.extend_from_array(&SRC_AMT.to_be_bytes());
+        params.append(&ctx.dst_token.clone().to_xdr(&ctx.env));
+        params.extend_from_array(&MIN_DST.to_be_bytes());
+        let params_hash: BytesN<32> = ctx.env.crypto().sha256(&params).into();
+
+        let mut pre = Bytes::from_slice(&ctx.env, b"vortex-intent-v1");
+        pre.append(&ctx.contract_id.clone().to_xdr(&ctx.env));
+        pre.append(&ctx.env.ledger().network_id().into());
+        pre.append(&ctx.user.clone().to_xdr(&ctx.env));
+        pre.extend_from_array(&nonce.to_be_bytes());
+        pre.append(&params_hash.into());
+        ctx.env.crypto().sha256(&pre).into()
+    };
+
+    let expected0 = reference(0);
+    assert_eq!(c.get_user_nonce(&ctx.user), 0);
+    assert_eq!(
+        c.preview_intent_id(&ctx.user, &src_chain, &SRC_AMT, &ctx.dst_token, &MIN_DST),
+        expected0
+    );
+
+    // Submitting at a different ledger time yields the precomputed id.
+    ctx.pass_time(12_345);
+    assert_eq!(ctx.submit(), expected0);
+
+    // The next submission uses nonce 1 and is likewise predictable.
+    ctx.pass_time(7);
+    assert_eq!(ctx.submit(), reference(1));
+}

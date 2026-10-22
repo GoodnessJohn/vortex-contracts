@@ -1,5 +1,15 @@
 # Client-Computable, Timestamp-Free Intent IDs (Issue #354)
 
+> **Implemented (issue #565).** `intent_settlement::compute_intent_id` now
+> uses this scheme with the arguments `submit_intent` actually takes:
+> `params_hash = sha256(xdr(src_chain) || be16(src_amount) || xdr(dst_token) || be16(min_dst_amount))`
+> and `intent_id = sha256("vortex-intent-v1" || xdr(contract_id) || network_id || xdr(user) || be8(nonce) || params_hash)`,
+> where `network_id = sha256(network_passphrase)`. The nonce is exposed via
+> `get_user_nonce(user)`; `preview_intent_id(...)` returns the id the next
+> submission will receive. The optional `client_supplied_id` argument and the
+> legacy timestamp scheme described below were **not** adopted: the legacy
+> scheme is replaced outright. The sections below are the original design.
+
 ## Problem
 
 Current intent ID scheme:
