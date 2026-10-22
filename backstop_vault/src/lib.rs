@@ -496,6 +496,19 @@ impl BackstopVault {
         (shares, queued)
     }
 
+    /// Returns the withdrawal cooldown expiration timestamp for `lp`.
+    ///
+    /// If the LP has no cooldown set, returns 0 (cooldown expired / no deposit yet).
+    /// If the returned timestamp is > current ledger timestamp, the LP cannot
+    /// withdraw until that timestamp passes.
+    /// Issue #533: Surface the cooldown timestamp for off-chain tooling.
+    pub fn get_withdrawal_cooldown(env: Env, lp: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WithdrawCooldown(lp))
+            .unwrap_or(0)
+    }
+
     // ── Private helpers ────────────────────────────────────────────────────────
 
     fn load_total_assets(env: &Env) -> i128 {
