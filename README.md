@@ -328,10 +328,89 @@ the exact condition that triggers it.
 | 34 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
 | 35 | `CancelCooldownNotExpired` | `cancel_intent` | Cannot cancel an Accepted intent whose solver was recently slashed (cooldown active) |
 | 36 | `AmountTooLarge` | `submit_intent` | Numeric input (e.g. `src_amount`) is too large to safely handle |
+| 37 | `BidWindowClosed` | `settle_bids` | Bid window has closed — cannot accept new bids |
+| 38 | `BidWindowStillOpen` | `settle_bids` | Cannot settle bids while bid window is still open |
+| 39 | `BidNotHigher` | `place_bid` | Submitted bid does not improve on the current best |
+| 40 | `IntentNotBidding` | `place_bid`, `settle_bids` | Intent is not in `Bidding` state |
+| 41 | `IntentNotFilling` | `release_fill` | Intent is not in `Filling` state |
+| 42 | `IntentNotDisputed` | `resolve_dispute` | Intent is not in `Disputed` state |
+| 43 | `NotArbiter` | `resolve_dispute` | Caller is not the designated arbiter |
+| 44 | `ArbiterWindowExpired` | `resolve_dispute` | Arbiter resolution window has elapsed |
+| 45 | `DisputeWindowStillOpen` | `release_fill` | Dispute window is still open — cannot release fill yet |
+| 46 | `DisputeWindowExpired` | `dispute_fill` | Dispute window has expired — cannot raise a dispute |
+| 47 | `DisputeWindowClosed` | `dispute_fill` | Dispute window has closed with no dispute filed |
+| 48 | `NoFillEscrowed` | `release_fill`, `dispute_fill` | No fill is currently held in escrow for this intent |
+| 49 | `NoPendingUpgrade` | `execute_upgrade` | No pending contract upgrade to execute |
+| 50 | `IntentNotAcceptedForFill` | `fill_intent` | `fill_intent` called on a non-`Accepted` intent (alternate message path) |
+| 51 | `TooManyBondTokens` | `register_solver` | Solver has too many bond tokens registered |
+| 52 | `TooManyRouteEntries` | `add_route` | Solver has too many route entries |
+| 53 | `BatchTooLarge` | `batch_*` | Batch size exceeds `MAX_BATCH_SIZE` |
+| 54 | `NoDisputeOpen` | `resolve_dispute` | No dispute is currently open for this intent |
+| 55 | `BackstopPoolEmpty` | `cover` | Backstop pool is empty — nothing to pay out |
+| 56 | `BackstopAlreadyClaimed` | `cover` | User already claimed backstop compensation for this intent |
+| 57 | `ExposureExceeded` | `accept_intent` | Accepting this intent would exceed the solver's coverage capacity |
+| 58 | `OraclePriceStale` | `submit_intent` | Oracle price data is stale (too old) |
+| 59 | `OraclePriceInvalid` | `submit_intent` | Oracle returned a zero or invalid price |
+| 60 | `OracleNotConfigured` | `submit_intent` | No oracle has been configured |
+| 61 | `OracleTimelockNotElapsed` | `execute_set_oracle` | Oracle timelock has not elapsed for the pending proposal |
+| 62 | `NoPendingOracle` | `execute_set_oracle` | No pending oracle proposal |
+| 63 | `IntentNotTerminal` | `close_intent` | `close_intent` called on an intent not in a terminal state (code 36, shared with `AmountTooLarge`) |
+| 64 | `RetentionPeriodNotElapsed` | `close_intent` | `close_intent` called before retention period elapsed |
+| 65 | `PolicyRejected` | `check_policy` | Configured policy contract rejected this intent |
+| 66 | `NoPendingPolicy` | `execute_set_policy` | No pending policy proposal |
+| 67 | `OperatorNotAuthorized` | `submit_intent` | Operator key expired or has insufficient permissions |
+| 68 | `OperatorLimitExceeded` | `submit_intent` | Attempted operation exceeds operator's per-intent limit |
+| 69 | `InvalidDelegateAmount` | `delegate_stake` | Delegated stake amount is too small or invalid |
+| 70 | `InsufficientDelegatedShares` | `undelegate` | Delegator has insufficient delegated shares to undelegate |
+| 71 | `UnbondingInProgress` | `undelegate` | Unbonding delay has not elapsed for undelegation |
+| 72 | `InvalidBidCommitment` | `reveal_bid` | Bid commitment is invalid or has expired |
+| 73 | `BidRevealMismatch` | `reveal_bid` | Bid reveal does not match committed hash |
+| 74 | `RevealWindowClosed` | `reveal_bid` | Reveal window has closed |
+| 75 | `ProofRegistryNotSet` | `fill_intent` | `require_proof = true` but no `ProofRegistry` configured |
+| 76 | `ProofNotFound` | `fill_intent` | `ProofRegistry.get_proof(intent_id)` returned `None` |
+| 77 | `ProofChainMismatch` | `fill_intent` | Proof's `src_chain_id` does not match Wormhole chain ID from `intent.src_chain` |
+| 78 | `ProofAmountInsufficient` | `fill_intent` | `proof.src_amount < intent.src_amount` |
+| 79 | `SrcChainNotSupported` | `submit_intent` | `intent.src_chain` not in canonical chain-name → Wormhole-chain-ID table |
+| 80 | `SelfReferral` | `submit_intent` | `referrer` equals submitting `user` (self-referral rejected) |
+| 81 | `InvalidConfig` | `set_config` | Invalid protocol configuration parameters |
+| 82 | `TimelockNotElapsed` | `accept_fee_recipient`, etc. | Called before timelock delay elapsed since matching `propose_*` |
+| 83 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
+| 84 | `NoPendingDstTokenChange` | `execute_add_dst_token`, etc. | No matching pending proposal for the given token |
+| 85 | `CancelCooldownNotExpired` | `cancel_intent` | Cannot cancel Accepted intent whose solver was recently slashed |
+| 86 | `AmountTooLarge` | `submit_intent` | Numeric input too large to safely handle (code 36, shared with `AmountTooLarge`) |
+| 87 | `AlreadyMigrated` | `migrate` | Contract already at current schema version |
+| 88 | `BidWindowClosed` | `settle_bids` | Bid window closed — cannot accept new bids |
+| 89 | `BidWindowStillOpen` | `settle_bids` | Bid window still open — cannot settle bids |
+| 90 | `BidNotHigher` | `place_bid` | Submitted bid does not improve on current best |
+| 91 | `IntentNotBidding` | `place_bid`, `settle_bids` | Intent not in `Bidding` state |
+| 92 | `IntentNotFilling` | `release_fill` | Intent not in `Filling` state |
+| 93 | `IntentNotDisputed` | `resolve_dispute` | Intent not in `Disputed` state |
+| 94 | `NotArbiter` | `resolve_dispute` | Caller is not the arbiter |
+| 95 | `ArbiterWindowExpired` | `resolve_dispute` | Arbiter resolution window elapsed |
+| 96 | `DisputeWindowStillOpen` | `release_fill` | Dispute window still open |
+| 97 | `DisputeWindowExpired` | `dispute_fill` | Dispute window expired |
+| 98 | `DisputeWindowClosed` | `dispute_fill` | Dispute window closed with no dispute |
+| 99 | `NoFillEscrowed` | `release_fill`, `dispute_fill` | No fill in escrow |
+| 100 | `NoPendingUpgrade` | `execute_upgrade` | No pending contract upgrade |
+| 101 | `IntentNotAcceptedForFill` | `fill_intent` | Intent not in `Accepted` state |
+| 102 | `TooManyBondTokens` | `register_solver` | Too many bond tokens |
+| 103 | `TooManyRouteEntries` | `add_route` | Too many route entries |
+| 104 | `BatchTooLarge` | `batch_*` | Batch exceeds `MAX_BATCH_SIZE` |
+| 105 | `NoDisputeOpen` | `resolve_dispute` | No dispute open |
+| 106 | `BackstopPoolEmpty` | `cover` | Backstop pool empty |
+| 107 | `BackstopAlreadyClaimed` | `cover` | User already claimed backstop compensation |
+| 108 | `ExposureExceeded` | `accept_intent` | Would exceed solver's coverage capacity |
+| 109 | `OraclePriceStale` | `submit_intent` | Oracle price data stale |
+| 110 | `OraclePriceInvalid` | `submit_intent` | Oracle returned zero/invalid price |
+| 111 | `OracleNotConfigured` | `submit_intent` | No oracle configured |
+| 112 | `OracleTimelockNotElapsed` | `execute_set_oracle` | Oracle timelock not elapsed |
+| 113 | `NoPendingOracle` | `execute_set_oracle` | No pending oracle proposal |
 
 ---
 
-### `solver_registry`
+**Note on duplicate discriminant values:** The contract's `Error` enum contains several variants that share the same discriminant code (e.g., `AmountTooLarge` and `IntentNotTerminal` both use code 36). The table above lists each variant with its documented code; callers should rely on the variant name, not the numeric code, for error handling.
+
+---
 
 Canonical store for solver **tiers** (Unranked → Platinum) and the per-tier
 perk schedule. `intent_settlement` calls `get_tier(solver)` from
