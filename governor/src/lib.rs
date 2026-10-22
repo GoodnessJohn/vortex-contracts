@@ -252,6 +252,15 @@ impl Governor {
         Ok(Self::voting_power(&env, &config.registry, &account, ledger))
     }
 
+    /// Returns the current governor configuration.
+    ///
+    /// This is a read-only view function that exposes the configuration
+    /// set during `initialize`. Useful for off-chain tooling and dashboards
+    /// to discover governance parameters.
+    pub fn get_config(env: Env) -> Result<GovernorConfig, GovernorError> {
+        Self::config(&env)
+    }
+
     // --- internals ---
 
     fn config(env: &Env) -> Result<GovernorConfig, GovernorError> {
