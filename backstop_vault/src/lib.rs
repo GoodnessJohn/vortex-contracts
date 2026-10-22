@@ -101,6 +101,7 @@ pub enum Error {
     EmergencyModeActive = 9,
     EmergencyModeNotActive = 10,
     NothingQueued = 11,
+    ArithmeticOverflow = 12,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -159,11 +160,13 @@ impl BackstopVault {
 
         // shares_minted = amount * total_shares / total_assets
         // Virtual entries guarantee total_assets > 0 always.
-        let shares_minted = amount
+        // Fail closed on overflow rather than substituting a wrong value.
+        let numerator = amount
             .checked_mul(total_shares)
-            .unwrap_or(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow));
+        let shares_minted = numerator
             .checked_div(total_assets)
-            .unwrap_or(1)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
             .max(1);
 
         // Transfer bond_token from LP to vault.

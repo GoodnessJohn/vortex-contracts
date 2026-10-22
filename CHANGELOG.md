@@ -11,6 +11,22 @@ first deploys to mainnet.
 
 ### Added
 
+- **TypeScript reference SDK now performs real contract calls (issue #480).**
+  Every method on `@vortex-protocol/sdk`'s `VortexClient` (`submitIntent`,
+  `acceptIntent`, `fillIntent`, `cancelIntent`, `registerSolver`,
+  `deregisterSolver`, `isSolverEligible`, `getIntent`, `getSolver`,
+  `listOpenIntents`, `listIntentsByUser`, `isPaused`, `getConfig`,
+  `getFeeSchedule`, `getProtocolHealth`, `proposeFeeRecipient`,
+  `acceptFeeRecipient`, `proposeAdminTransfer`, `acceptAdminTransfer`,
+  `proposeAddDstToken`, `addAllowedSrcChain`, `isSrcChainAllowed`,
+  `slashSolver`, `rescueTokens`) now builds, simulates and submits a real
+  Soroban RPC invocation against `intent_settlement`, decoding the returned
+  `ScVal` into typed results instead of throwing an unconditional
+  "not yet implemented" error. Argument encoding follows the contract's
+  actual entrypoint signatures in `intent_settlement/src/lib.rs`.
+- **Jest test suite for `packages/sdk` (issue #481).** Covers every public
+  client method against a mocked Soroban RPC (simulation, submission and
+  result decoding paths), wired into CI so the SDK has regression protection.
 - **CI: Enforce CHANGELOG.md updates (issue #294).** A new CI job verifies that
   every PR changing `intent_settlement/src/` or `proof_registry/src/` includes a
   corresponding update to `CHANGELOG.md`. An escape hatch (`no-changelog-needed`
@@ -216,6 +232,8 @@ first deploys to mainnet.
 
 ### Documentation
 
+- `packages/sdk/README.md`: removed the "not yet implemented" caveats now
+  that every client method performs a real contract call (#480).
 - README: added `stellar contract invoke` usage examples for the core
   intent lifecycle and an up-to-date entrypoint list.
 - Filled in missing rustdoc on `unpause`, `is_paused`, and the view

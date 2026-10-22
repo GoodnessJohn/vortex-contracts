@@ -22,19 +22,41 @@ const RUST_FILE = path.resolve(
 );
 const TS_FILE = path.resolve(__dirname, "../src/index.ts");
 
+// Rust sources for the five newest contracts (issue #482).
+const GOVERNOR_RUST_FILE = path.resolve(
+  __dirname,
+  "../../governor/src/lib.rs"
+);
+const BACKSTOP_VAULT_RUST_FILE = path.resolve(
+  __dirname,
+  "../../backstop_vault/src/lib.rs"
+);
+const FEE_ROUTER_RUST_FILE = path.resolve(
+  __dirname,
+  "../../fee_router/src/lib.rs"
+);
+const TREASURY_STREAMS_RUST_FILE = path.resolve(
+  __dirname,
+  "../../treasury_streams/src/lib.rs"
+);
+const INTENT_PERIPHERY_RUST_FILE = path.resolve(
+  __dirname,
+  "../../intent_periphery/src/lib.rs"
+);
+
 const checks = [];
 let hasErrors = false;
 
 /**
  * Check if a pattern exists in the Rust file
  */
-function checkRustPattern(pattern, description) {
-  const content = fs.readFileSync(RUST_FILE, "utf-8");
+function checkRustPattern(pattern, description, rustFile = RUST_FILE) {
+  const content = fs.readFileSync(rustFile, "utf-8");
   const regex = typeof pattern === "string" ? new RegExp(pattern) : pattern;
 
   if (!regex.test(content)) {
     console.error(`❌ DRIFT: ${description}`);
-    console.error(`   Pattern not found in ${RUST_FILE}`);
+    console.error(`   Pattern not found in ${rustFile}`);
     hasErrors = true;
   } else {
     console.log(`✓ ${description}`);
@@ -79,11 +101,82 @@ function extractTsEnumVariants(enumName) {
 /**
  * Count occurrences of a pattern in Rust
  */
-function countRustPattern(pattern) {
-  const content = fs.readFileSync(RUST_FILE, "utf-8");
+function countRustPattern(pattern, rustFile = RUST_FILE) {
+  const content = fs.readFileSync(rustFile, "utf-8");
   const regex = typeof pattern === "string" ? new RegExp(pattern, "g") : pattern;
   const matches = content.match(regex);
   return matches ? matches.length : 0;
+}
+
+/**
+ * Check that a Rust #[contracttype] struct exists in the given Rust file and
+ * that a matching TypeScript interface exists in src/index.ts.
+ */
+function checkContractStruct(rustFile, structName, tsName = structName) {
+  checkRustPattern(
+    new RegExp(`pub struct ${structName}\\s*\\{`),
+    `${structName} struct in Rust`,
+    rustFile
+  );
+  checkTsPattern(
+    new RegExp(`export interface ${tsName}\\b`),
+    `${tsName} interface in TS`
+  );
+}
+
+/**
+ * Check that a Rust #[contracttype] enum exists in the given Rust file and
+ * that a matching TypeScript enum exists in src/index.ts.
+ */
+function checkContractEnum(rustFile, enumName, tsName = enumName) {
+  checkRustPattern(
+    new RegExp(`pub enum ${enumName}\\s*\\{`),
+    `${enumName} enum in Rust`,
+    rustFile
+  );
+  checkTsPattern(
+    new RegExp(`export enum ${tsName}\\b`),
+    `${tsName} enum in TS`
+  );
+}
+
+/**
+ * Check that each field of a Rust struct is present in the Rust source and
+ * has a corresponding property in the TypeScript interface.
+ */
+function checkStructFields(rustFile, structName, fields) {
+  fields.forEach((field) => {
+    checkRustPattern(
+      new RegExp(`pub ${field}:`),
+      `${structName}.${field} in Rust`,
+      rustFile
+    );
+    checkTsPattern(
+      new RegExp(`${field}[:\\?]`),
+      `${structName}.${field} in TS`
+    );
+  });
+}
+
+/**
+ * Check that each variant of a Rust enum is present in the Rust source and in
+ * the corresponding TypeScript enum.
+ */
+function checkEnumVariants(rustFile, enumName, variants, tsName = enumName) {
+  const tsVariants = extractTsEnumVariants(tsName);
+  variants.forEach((variant) => {
+    checkRustPattern(
+      new RegExp(`\\b${variant}\\b`),
+      `${enumName}.${variant} in Rust`,
+      rustFile
+    );
+    if (!tsVariants.includes(variant)) {
+      console.error(`❌ DRIFT: ${tsName}.${variant} missing in TS`);
+      hasErrors = true;
+    } else {
+      console.log(`✓ ${tsName}.${variant}`);
+    }
+  });
 }
 
 console.log("🔍 Checking TypeScript/Rust type definition drift...\n");
@@ -233,10 +326,148 @@ importantErrors.forEach((error) => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Governor (issue #482)
+// ---------------------------------------------------------------------------
+console.log("\nGovernor:");
+checkContractStruct(GOVERNOR_RUST_FILE, "Proposal");
+checkContractStruct(GOVERNOR_RUST_FILE, "GovernorConfig");
+checkContractEnum(GOVERNOR_RUST_FILE, "ProposalState");
+checkContractEnum(GOVERNOR_RUST_FILE, "VoteType");
+
+console.log("\nGovernor.Proposal Fields:");
+checkStructFields(GOVERNOR_RUST_FILE, "Proposal", [
+  "id",
+  "proposer",
+  "description_hash",
+  "start_time",
+  "end_time",
+  "for_votes",
+  "against_votes",
+  "abstain_votes",
+  "executed",
+  "cancelled",
+]);
+
+console.log("\nGovernor.GovernorConfig Fields:");
+checkStructFields(GOVERNOR_RUST_FILE, "GovernorConfig", [
+  "voting_delay",
+  "voting_period",
+  "quorum",
+  "proposal_threshold",
+  "timelock_delay",
+]);
+
+console.log("\nGovernor.ProposalState Variants:");
+checkEnumVariants(GOVERNOR_RUST_FILE, "ProposalState", [
+  "Pending",
+  "Active",
+  "Defeated",
+  "Succeeded",
+  "Queued",
+  "Executed",
+  "Cancelled",
+]);
+
+console.log("\nGovernor.VoteType Variants:");
+checkEnumVariants(GOVERNOR_RUST_FILE, "VoteType", [
+  "For",
+  "Against",
+  "Abstain",
+]);
+
+// ---------------------------------------------------------------------------
+// Backstop Vault (issue #482)
+// ---------------------------------------------------------------------------
+console.log("\nBackstop Vault:");
+checkContractStruct(BACKSTOP_VAULT_RUST_FILE, "VaultConfig");
+checkContractStruct(BACKSTOP_VAULT_RUST_FILE, "DepositRecord");
+
+console.log("\nBackstopVault.VaultConfig Fields:");
+checkStructFields(BACKSTOP_VAULT_RUST_FILE, "VaultConfig", [
+  "token",
+  "cooldown_period",
+  "min_deposit",
+  "capacity",
+]);
+
+console.log("\nBackstopVault.DepositRecord Fields:");
+checkStructFields(BACKSTOP_VAULT_RUST_FILE, "DepositRecord", [
+  "depositor",
+  "amount",
+  "deposited_at",
+  "unlock_at",
+]);
+
+// ---------------------------------------------------------------------------
+// Fee Router (issue #482)
+// ---------------------------------------------------------------------------
+console.log("\nFee Router:");
+checkContractStruct(FEE_ROUTER_RUST_FILE, "Sink");
+checkContractStruct(FEE_ROUTER_RUST_FILE, "FeeConfig");
+
+console.log("\nFeeRouter.Sink Fields:");
+checkStructFields(FEE_ROUTER_RUST_FILE, "Sink", [
+  "recipient",
+  "share_bps",
+]);
+
+console.log("\nFeeRouter.FeeConfig Fields:");
+checkStructFields(FEE_ROUTER_RUST_FILE, "FeeConfig", [
+  "token",
+  "total_bps",
+  "sinks",
+]);
+
+// ---------------------------------------------------------------------------
+// Treasury Streams (issue #482)
+// ---------------------------------------------------------------------------
+console.log("\nTreasury Streams:");
+checkContractStruct(TREASURY_STREAMS_RUST_FILE, "Stream");
+
+console.log("\nTreasuryStreams.Stream Fields:");
+checkStructFields(TREASURY_STREAMS_RUST_FILE, "Stream", [
+  "id",
+  "recipient",
+  "token",
+  "rate_per_ledger",
+  "start_ledger",
+  "end_ledger",
+  "withdrawn",
+  "cancelled",
+]);
+
+// ---------------------------------------------------------------------------
+// Intent Periphery (issue #482)
+// ---------------------------------------------------------------------------
+console.log("\nIntent Periphery:");
+checkContractStruct(INTENT_PERIPHERY_RUST_FILE, "SwapParams");
+checkContractStruct(INTENT_PERIPHERY_RUST_FILE, "SwapResult");
+
+console.log("\nIntentPeriphery.SwapParams Fields:");
+checkStructFields(INTENT_PERIPHERY_RUST_FILE, "SwapParams", [
+  "src_token",
+  "dst_token",
+  "src_amount",
+  "min_dst_amount",
+  "deadline",
+  "recipient",
+]);
+
+console.log("\nIntentPeriphery.SwapResult Fields:");
+checkStructFields(INTENT_PERIPHERY_RUST_FILE, "SwapResult", [
+  "intent_id",
+  "dst_amount",
+  "solver",
+]);
+
 // Summary
 console.log("\n" + "─".repeat(60));
 if (hasErrors) {
   console.error("❌ Type definition drift detected!");
+  console.error(
+    "TypeScript types do not match Rust struct/enum definitions."
+  );
   process.exit(1);
 } else {
   console.log("✅ No type definition drift detected.");

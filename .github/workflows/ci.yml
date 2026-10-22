@@ -35,6 +35,7 @@ on:
 #   audit         — checkout, cargo audit            → contents: read  ✓
 #   secrets-scan  — checkout only                    → contents: read  ✓
 #   mutants       — checkout, cargo mutants          → contents: read  ✓
+#   sdk-tests     — checkout, npm ci, npm test       → contents: read  ✓
 permissions:
   contents: read
 
@@ -446,6 +447,28 @@ jobs:
       - name: Check Postman collection sync
         run: scripts/check-view-calls-sync.sh
         shell: bash
+
+  sdk-tests:
+    name: SDK test suite (packages/sdk)
+    runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). npm ci / npm test run entirely on
+    # the runner against a mocked/local Soroban RPC — no GitHub API calls.
+    # Inherits workflow-level minimum.
+    defaults:
+      run:
+        working-directory: packages/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: packages/sdk/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
 
   risk-aware-solver-bot-tests:
     name: Test risk_aware_solver_bot.py (Issue #293)
