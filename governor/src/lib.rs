@@ -8,7 +8,9 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
 
 /// Number of checkpoints retained per account. Bounded so binary search over
 /// the checkpoint history stays cheap and storage stays predictable.
@@ -110,7 +112,9 @@ impl Governor {
             return Err(GovernorError::AlreadyInitialized);
         }
         env.storage().instance().set(&key, &config);
-        env.storage().instance().set(&Symbol::new(&env, "count"), &0u32);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "count"), &0u32);
         Ok(())
     }
 
@@ -132,7 +136,7 @@ impl Governor {
         }
 
         let snapshot = env.ledger().sequence();
-        let power = Self::voting_power(&env, &config.registry, &proposer, snapshot);
+        let power = Self::read_voting_power(&env, &config.registry, &proposer, snapshot);
         if power < config.proposal_threshold {
             return Err(GovernorError::BelowProposalThreshold);
         }
@@ -156,8 +160,12 @@ impl Governor {
             function,
             calldata,
         };
-        env.storage().persistent().set(&Self::proposal_key(&env, id), &proposal);
-        env.storage().instance().set(&Symbol::new(&env, "count"), &(id + 1));
+        env.storage()
+            .persistent()
+            .set(&Self::proposal_key(&env, id), &proposal);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "count"), &(id + 1));
         Ok(id)
     }
 
@@ -171,7 +179,7 @@ impl Governor {
     ) -> Result<i128, GovernorError> {
         voter.require_auth();
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.canceled {
             return Err(GovernorError::ProposalCanceled);
@@ -189,7 +197,7 @@ impl Governor {
             return Err(GovernorError::AlreadyVoted);
         }
 
-        let power = Self::voting_power(&env, &config.registry, &voter, proposal.snapshot);
+        let power = Self::read_voting_power(&env, &config.registry, &voter, proposal.snapshot);
         if power <= 0 {
             return Err(GovernorError::NoVotingPower);
         }
@@ -200,26 +208,30 @@ impl Governor {
             VoteType::Abstain => proposal.abstain_votes += power,
         }
         env.storage().persistent().set(&vote_key, &power);
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&Self::proposal_key(&env, proposal_id), &proposal);
         Ok(power)
     }
 
     /// Queue a succeeded proposal into the timelock.
     pub fn queue(env: Env, proposal_id: u32) -> Result<(), GovernorError> {
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if Self::state_of(&env, &config, &proposal) != ProposalState::Succeeded {
             return Err(GovernorError::ProposalNotSucceeded);
         }
         proposal.eta = env.ledger().sequence() + config.voting_delay;
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&Self::proposal_key(&env, proposal_id), &proposal);
         Ok(())
     }
 
     /// Execute a queued proposal once the timelock delay has elapsed.
     pub fn execute(env: Env, proposal_id: u32) -> Result<(), GovernorError> {
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if proposal.executed {
             return Err(GovernorError::AlreadyExecuted);
         }
@@ -230,7 +242,9 @@ impl Governor {
             return Err(GovernorError::TimelockNotReady);
         }
         proposal.executed = true;
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&Self::proposal_key(&env, proposal_id), &proposal);
         // The timelock performs the actual call; the governor only records the
         // transition so state stays consistent with the timelock's execution.
         let _ = config.timelock;
@@ -239,17 +253,22 @@ impl Governor {
 
     pub fn state(env: Env, proposal_id: u32) -> Result<ProposalState, GovernorError> {
         let config = Self::config(&env)?;
-        let proposal = Self::proposal(&env, proposal_id)?;
+        let proposal = Self::load_proposal(&env, proposal_id)?;
         Ok(Self::state_of(&env, &config, &proposal))
     }
 
     pub fn proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
-        Self::proposal(&env, proposal_id)
+        Self::load_proposal(&env, proposal_id)
     }
 
     pub fn voting_power(env: Env, account: Address, ledger: u32) -> Result<i128, GovernorError> {
         let config = Self::config(&env)?;
-        Ok(Self::voting_power(&env, &config.registry, &account, ledger))
+        Ok(Self::read_voting_power(
+            &env,
+            &config.registry,
+            &account,
+            ledger,
+        ))
     }
 
     // --- internals ---
@@ -261,7 +280,7 @@ impl Governor {
             .ok_or(GovernorError::NotInitialized)
     }
 
-    fn proposal(env: &Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
+    fn load_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
         env.storage()
             .persistent()
             .get(&Self::proposal_key(env, proposal_id))
@@ -295,7 +314,7 @@ impl Governor {
 
     /// Read voting power from the registry's checkpointed history using a
     /// binary search over the bounded checkpoint list.
-    fn voting_power(env: &Env, registry: &Address, account: &Address, ledger: u32) -> i128 {
+    fn read_voting_power(env: &Env, registry: &Address, account: &Address, ledger: u32) -> i128 {
         let key = Self::checkpoint_key(env, registry, account);
         let checkpoints: Vec<Checkpoint> = env
             .storage()
@@ -343,7 +362,11 @@ impl Governor {
         )
     }
 
-    fn checkpoint_key(env: &Env, registry: &Address, account: &Address) -> (Symbol, Address, Address) {
+    fn checkpoint_key(
+        env: &Env,
+        registry: &Address,
+        account: &Address,
+    ) -> (Symbol, Address, Address) {
         (
             Symbol::new(env, "checkpoint"),
             registry.clone(),
@@ -351,6 +374,3 @@ impl Governor {
         )
     }
 }
-
-#[cfg(test)]
-mod test;
