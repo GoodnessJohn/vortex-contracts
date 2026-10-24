@@ -19,6 +19,26 @@ pub enum DataKey {
 }
 
 /// A single payment stream.
+///
+/// # Vesting semantics for adjustments
+///
+/// A stream's `total` is always vested linearly across `start..end` (with the
+/// `cliff` gate), i.e. `vested_amount` is recomputed from the *current* `total`
+/// and `end` on every read. This makes the two governor-gated adjustment
+/// entrypoints well-defined:
+///
+/// * `top_up(stream_id, additional_amount)` escrows `additional_amount` from
+///   the stream's `sender` and adds it to `stream.total`. The newly added funds
+///   vest on the *same* schedule as the original: the whole new `total` is
+///   re-stretched across `start..end`. (If the stream has already ended, the
+///   full new total is immediately vested.)
+/// * `extend(stream_id, new_end)` sets `stream.end = new_end`, re-stretching
+///   the remaining unvested amount over the new (longer) duration. `new_end`
+///   must be `> start` and `>= end`; shortening is rejected with
+///   `InvalidSchedule` so already-vested funds can never be un-vested.
+///
+/// Both are governor-only (authority symmetric with `create_stream`/`cancel`)
+/// and are rejected once the stream is cancelled.
 #[contracttype]
 #[derive(Clone)]
 pub struct Stream {
@@ -260,6 +280,81 @@ impl TreasuryStreams {
         env.events().publish(
             (soroban_sdk::symbol_short!("cancel"), stream_id),
             (stream.sender.clone(), unvested),
+        );
+        Ok(())
+    }
+
+    /// Adds `additional_amount` to an existing stream. Only the governor may
+    /// call this. The funds are pulled from the stream's `sender` into escrow
+    /// and the whole new `total` is re-stretched across the original
+    /// `start..end` schedule (see [`Stream`] docs for the vesting semantics).
+    pub fn top_up(env: Env, stream_id: u64, additional_amount: i128) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if additional_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Escrow the additional deposit before mutating state.
+        token::Client::new(&env, &stream.token).transfer(
+            &stream.sender,
+            &env.current_contract_address(),
+            &additional_amount,
+        );
+
+        stream.total += additional_amount;
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("top_up"), stream_id),
+            (stream.sender.clone(), additional_amount, stream.total),
+        );
+        Ok(())
+    }
+
+    /// Extends an existing stream's `end` to `new_end`. Only the governor may
+    /// call this. `new_end` must be `> start` and `>= end`; shortening is
+    /// rejected with `InvalidSchedule`. The remaining unvested amount is
+    /// re-stretched over the new duration (see [`Stream`] docs).
+    pub fn extend(env: Env, stream_id: u64, new_end: u64) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if new_end <= stream.start || new_end < stream.end {
+            return Err(Error::InvalidSchedule);
+        }
+
+        stream.end = new_end;
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("extend"), stream_id),
+            (stream.sender.clone(), new_end, stream.total),
         );
         Ok(())
     }
