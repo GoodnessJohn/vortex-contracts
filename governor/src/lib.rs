@@ -388,28 +388,41 @@ impl Governor {
         // Ask the timelock to execute the scheduled call. The timelock performs
         // the actual `invoke_contract` on the proposal's target.
         let args: Vec<Val> = Vec::new(&env);
-        env.invoke_contract::<()>(
-            &config.timelock,
-            &Symbol::new(&env, "execute"),
-            (proposal.target.clone(), proposal.function.clone(), args).into_val(&env),
-        );
-        proposal.executed = true;
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
-        // The timelock performs the actual call; the governor records the
-        // transition and invokes the target through the timelock so state stays
-        // consistent with the timelock's execution.
-        let args: Vec<Val> = Vec::new(&env);
         env.invoke_contract::<Val>(
             &config.timelock,
             &Symbol::new(&env, "execute"),
             (proposal.target.clone(), proposal.function.clone(), proposal.calldata.clone(), args)
                 .into_val(&env),
         );
+        proposal.executed = true;
+        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
         env.events().publish(
             (symbol_short!("execute"),),
             (proposal_id, proposal.target.clone(), proposal.function.clone()),
         );
         Ok(())
+    }
+
+    /// The governor's own configuration.
+    ///
+    /// Every other contract in the repo with an admin/protocol config struct
+    /// exposes a public getter for it (e.g. `intent_settlement::get_config`).
+    /// `governor` was the exception: `GovernorConfig` was only ever read
+    /// internally through the private `Self::config` helper, which made it
+    /// impossible for a UI, dashboard or off-chain tool to display the
+    /// governor's own parameters — the registry it reads voting power from,
+    /// the timelock it queues into, the voting delay, the voting period, the
+    /// proposal threshold and the quorum — without guessing at private storage
+    /// layout.
+    ///
+    /// This is a read-only view: it performs no authorization check (there is
+    /// nothing to authorize — the configuration is public by nature) and it
+    /// mutates no state.
+    ///
+    /// Returns [`GovernorError::NotInitialized`] if the governor has not been
+    /// initialized yet, exactly like every other entrypoint.
+    pub fn get_config(env: Env) -> Result<GovernorConfig, GovernorError> {
+        Self::config(&env)
     }
 
     pub fn state(env: Env, proposal_id: u32) -> Result<ProposalState, GovernorError> {
