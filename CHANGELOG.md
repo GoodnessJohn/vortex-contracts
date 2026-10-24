@@ -109,6 +109,21 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Duplicated escrow/dispute entrypoints merged (issue #98, #342).**
+  `begin_fill`, `release_fill`, and `resolve_dispute` were each defined twice
+  in `intent_settlement/src/lib.rs` (two complete, parallel, never-merged
+  implementations left behind by a bad merge), and dispute opening existed as
+  two separate entrypoints — `open_dispute` and `dispute_fill` — that differed
+  on whether a `DISPUTE_BOND` is required. Each pair is now collapsed into a
+  single implementation, and dispute opening is a single coherent path:
+  `dispute_fill` is the sole dispute-opening entrypoint and requires the
+  `DISPUTE_BOND` (anti-griefing: a user cannot freeze a solver's escrowed fill
+  for the full `DISPUTE_WINDOW` for free, and the bond is returned on an
+  `Upheld` ruling / forfeited to the solver on a `Dismissed` one). The
+  bond-free `open_dispute` variant is removed. The surviving implementations
+  are the later-indexed (newer design iteration) bodies, verified
+  function-by-function against their doc comments; the merged dispute suite
+  covers both previously-divergent paths.
 - Upgraded `soroban-sdk` from `21.0.0` to `22.0.0` across the workspace root and every contract crate (`intent_settlement`, `proof_registry`, `solver_registry`, `reputation_badge`, `backstop_vault`), closing the gap left by issue #377. Migration checklist followed from `docs/event-schema.md` (typed events, test registration API, TTL/auth API notes).
 - **`fee_router` rewritten as a real Soroban contract (issue #464).**
   `fee_router/src/lib.rs` is now a deployable `#![no_std]` contract with
@@ -175,6 +190,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`proof_registry` compile failure (issue #97).** `proof_registry` did not
+  type-check, which blocked `intent_settlement` (and its dispute-resolution
+  suite) from being compiled at all; the crate now builds cleanly, unblocking
+  the entrypoint merge above.
 - **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
   not build — `lib.rs` referenced ~12 undeclared constants, 9 undeclared
   `DataKey` variants and 6 undeclared `Error` variants, the `Error` enum had
