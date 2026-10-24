@@ -85,10 +85,14 @@ pub struct TreasuryStreams;
 #[contractimpl]
 impl TreasuryStreams {
     /// One-time initialization setting the governor (timelock/governor) address.
+    ///
+    /// The `governor` must authorize this call so that an attacker cannot
+    /// front-run initialization and install themselves as governor.
     pub fn initialize(env: Env, governor: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Governor) {
             return Err(Error::AlreadyInitialized);
         }
+        governor.require_auth();
         env.storage().instance().set(&DataKey::Governor, &governor);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::Paused, &false);
