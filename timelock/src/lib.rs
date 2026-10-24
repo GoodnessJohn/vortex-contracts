@@ -244,7 +244,7 @@ impl TimelockController {
             .set(&(OP_KEY, id.clone()), &operation);
 
         env.events()
-            .publish((symbol_short!("scheduled"), id.clone()), operation.ready_at);
+            .publish((symbol_short!("scheduled"), id.clone()), id.clone());
 
         id
     }
