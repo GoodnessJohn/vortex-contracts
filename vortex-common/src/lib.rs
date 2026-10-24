@@ -154,6 +154,11 @@ pub fn compute_slash_bps(tier: u32) -> i128 {
 
 /// Helper to assert the caller is admin.
 ///
+/// `admin_key` is the instance-storage key under which the admin `Address` is
+/// stored. It must be a concrete storage-key type (e.g. a `Symbol` or a
+/// contract-defined key enum) that implements `IntoVal<Env, Val>` so it can be
+/// passed to `storage().instance().get(...)`.
+///
 /// #575: The `IntoVal` bound was written as `IntoVal<Env>` with a single
 /// generic argument, but the trait takes two (`IntoVal<E, T>`). The crate
 /// therefore did not compile, which blocked the unit-test suite — and with it
@@ -166,11 +171,10 @@ pub fn compute_slash_bps(tier: u32) -> i128 {
 /// deliberately left as-is here; widening it to a dedicated error enum is a
 /// separate API change.
 #[allow(clippy::result_unit_err)]
-pub fn require_admin(
-  env: &Env,
-  admin_key: impl soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
-  caller: &Address,
-) -> Result<(), ()> {
+pub fn require_admin<K>(env: &Env, admin_key: K, caller: &Address) -> Result<(), ()>
+where
+  K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>,
+{
   let admin: Address = env.storage().instance().get(&admin_key).ok_or(())?;
   if admin != *caller {
     return Err(());

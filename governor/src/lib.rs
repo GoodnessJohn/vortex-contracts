@@ -5,6 +5,18 @@
 //! stake acquired after the snapshot cannot influence an in-flight vote
 //! (anti-flash-stake). Passed proposals are queued into the
 //! `TimelockController` and executed after the timelock delay.
+//!
+//! ## Voting power source (v1)
+//!
+//! The governor maintains its own checkpoint history per account, fed by an
+//! explicit `sync_power` call. `sync_power` reads the account's current bond
+//! from `solver_registry` (the v1 source of truth) and appends a `Checkpoint`
+//! at the current ledger. This keeps the governor self-contained (no
+//! cross-contract read at vote time) while still deriving power from the
+//! registry's bond data.
+//!
+//! Delegation (bond + delegated stake) is a documented follow-up and is out of
+//! scope for v1: only the account's own bond contributes to its power.
 
 #![no_std]
 
@@ -181,6 +193,19 @@ impl Governor {
             ),
         );
         Ok(())
+    }
+
+    /// Record the caller's current voting power as a checkpoint.
+    ///
+    /// Reads the account's bond from `solver_registry` (v1 source of truth)
+    /// and appends a `Checkpoint` at the current ledger. Must be called by the
+    /// account itself so power cannot be forged for another address.
+    pub fn sync_power(env: Env, account: Address) -> Result<i128, GovernorError> {
+        account.require_auth();
+        let config = Self::config(&env)?;
+        let power = Self::read_registry_bond(&env, &config.registry, &account);
+        Self::write_checkpoint(&env, &account, power);
+        Ok(power)
     }
 
     /// Create a proposal. Voting power is snapshotted at the current ledger.
@@ -480,6 +505,34 @@ impl Governor {
     /// Alias kept for callers that use the `compute_voting_power` name.
     fn compute_voting_power(env: &Env, registry: &Address, account: &Address, ledger: u32) -> i128 {
         Self::voting_power(env, registry, account, ledger)
+    }
+
+    /// Read the account's current bond from `solver_registry` (v1 source of
+    /// truth for voting power).
+    fn read_registry_bond(env: &Env, registry: &Address, account: &Address) -> i128 {
+        env.invoke_contract::<i128>(
+            registry,
+            &Symbol::new(env, "bond"),
+            (account.clone(),).into_val(env),
+        )
+    }
+
+    /// Append a checkpoint for `account` at the current ledger, capping the
+    /// history at `MAX_CHECKPOINTS` by dropping the oldest entry.
+    fn write_checkpoint(env: &Env, account: &Address, power: i128) {
+        let config = Self::config(env).expect("config");
+        let key = Self::checkpoint_key(env, &config.registry, account);
+        let mut checkpoints: Vec<Checkpoint> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        let ledger = env.ledger().sequence();
+        checkpoints.push_back(Checkpoint { ledger, power });
+        while checkpoints.len() > MAX_CHECKPOINTS {
+            checkpoints.remove(0);
+        }
+        env.storage().persistent().set(&key, &checkpoints);
     }
 
     /// Binary search for the latest checkpoint at or before `ledger`.
