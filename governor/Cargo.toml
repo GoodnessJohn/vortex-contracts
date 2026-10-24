@@ -10,6 +10,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+vortex-common = { path = "../vortex-common" }
 solver_registry = { path = "../solver_registry" }
 timelock = { path = "../timelock" }
 

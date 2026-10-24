@@ -24,10 +24,14 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
     IntoVal, Symbol, Val, Vec,
 };
+use vortex_common::require_admin;
 
 /// Number of checkpoints retained per account. Bounded so binary search over
 /// the checkpoint history stays cheap and storage stays predictable.
 pub const MAX_CHECKPOINTS: u32 = 64;
+
+/// Maximum number of proposals returned by a single `list_proposals` call.
+pub const MAX_LIST_LIMIT: u32 = 50;
 
 /// Minimum voting delay (in ledgers) accepted at `initialize`/`update_config`.
 pub const MIN_VOTING_DELAY: u32 = 1;
@@ -418,6 +422,50 @@ impl Governor {
         Self::load_proposal(&env, proposal_id)
     }
 
+    /// Total number of proposals ever created. Proposal ids are dense in
+    /// `[0, count)`, so this doubles as the exclusive upper bound for
+    /// pagination.
+    pub fn get_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "count"))
+            .unwrap_or(0u32)
+    }
+
+    /// Paginated proposal listing. Returns proposals with ids in
+    /// `[start, start + limit)`, clamped to the total proposal count and to
+    /// `MAX_LIST_LIMIT`. Mirrors `intent_settlement`'s pagination convention.
+    pub fn list_proposals(env: Env, start: u32, limit: u32) -> Vec<Proposal> {
+        let count = Self::get_proposal_count(env.clone());
+        let mut out = Vec::new(&env);
+        if start >= count || limit == 0 {
+            return out;
+        }
+        let capped = if limit > MAX_LIST_LIMIT { MAX_LIST_LIMIT } else { limit };
+        let end = if start > count - capped { count } else { start + capped };
+        let mut id = start;
+        while id < end {
+            if let Some(proposal) = env
+                .storage()
+                .persistent()
+                .get::<_, Proposal>(&Self::proposal_key(&env, id))
+            {
+                out.push_back(proposal);
+            }
+            id += 1;
+        }
+        out
+    }
+
+    /// Admin-gated update of the governor configuration. The admin is the
+    /// current contract address' stored admin, validated via
+    /// `vortex_common::require_admin`.
+    pub fn set_config(env: Env, admin: Address, config: GovernorConfig) -> Result<(), GovernorError> {
+        require_admin(&env, &admin).map_err(|_| GovernorError::NotAuthorized)?;
+        env.storage().instance().set(&Symbol::new(&env, "config"), &config);
+        Ok(())
+    }
+
     pub fn voting_power(env: Env, account: Address, ledger: u32) -> Result<i128, GovernorError> {
         let config = Self::config(&env)?;
         Ok(Self::voting_power(&env, &config.registry, &account, ledger))
@@ -459,10 +507,7 @@ impl Governor {
     }
 
     fn proposal(env: &Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
-        env.storage()
-            .persistent()
-            .get(&Self::proposal_key(env, proposal_id))
-            .ok_or(GovernorError::ProposalNotFound)
+        Self::load_proposal(env, proposal_id)
     }
 
     fn state_of(env: &Env, config: &GovernorConfig, proposal: &Proposal) -> ProposalState {
