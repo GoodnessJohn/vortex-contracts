@@ -29,12 +29,14 @@ on:
 #
 # Per-job audit (all trigger types, checked 2026-08-31):
 #   fmt           — checkout only                    → contents: read  ✓
+#   cargo-check   — checkout, cargo check            → contents: read  ✓
 #   contract      — checkout, clippy, test           → contents: read  ✓
 #   wasm-size     — checkout, build, STEP_SUMMARY    → contents: read  ✓
 #   proptest      — checkout, cargo test             → contents: read  ✓
 #   audit         — checkout, cargo audit            → contents: read  ✓
 #   secrets-scan  — checkout only                    → contents: read  ✓
 #   mutants       — checkout, cargo mutants          → contents: read  ✓
+#   sdk-tests     — checkout, npm ci, npm test       → contents: read  ✓
 #   policy-daily-cap-tests — checkout, cargo test    → contents: read  ✓
 permissions:
   contents: read
@@ -119,6 +121,44 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # ── Compile gate ────────────────────────────────────────────────────────────
+  #
+  # Regression guard for issue #557: `proof_registry` (and therefore
+  # `intent_settlement`, which path-depends on it) once failed to compile while
+  # CI appeared green.  This job runs a plain `cargo check --all-targets` for
+  # every workspace member crate, with no caching and no feature/toolchain
+  # matrix, so a compile error can never be masked by a stale `rust-cache`
+  # entry or by a different toolchain resolving differently than locally.
+  #
+  # This job is intended to be a *required* status check on `main`.
+  cargo-check:
+    name: cargo check (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). Inherits workflow-level minimum.
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - intent_settlement
+          - proof_registry
+          - solver_registry
+          - backstop_vault
+          - reputation_badge
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # Deliberately NO Swatinem/rust-cache here.  A stale cache was one of the
+      # suspected reasons the breakage in #557 went unnoticed; a cold build is
+      # slower but cannot produce a false green.
+      - name: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
   contract:
     name: Contract (${{ matrix.crate }} / ${{ matrix.toolchain }})
@@ -470,6 +510,28 @@ jobs:
         run: scripts/check-view-calls-sync.sh
         shell: bash
 
+  sdk-tests:
+    name: SDK test suite (packages/sdk)
+    runs-on: ubuntu-latest
+    # Needs: contents: read (checkout only). npm ci / npm test run entirely on
+    # the runner against a mocked/local Soroban RPC — no GitHub API calls.
+    # Inherits workflow-level minimum.
+    defaults:
+      run:
+        working-directory: packages/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: packages/sdk/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
+
   error-reference-sync:
     name: Check Error Reference table sync (Issue #531)
     runs-on: ubuntu-latest
@@ -581,4 +643,3 @@ jobs:
             echo "⚠️ Resource cost drift detected (advisory check)" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-

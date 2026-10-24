@@ -11,8 +11,11 @@
 //! - Weight changes are timelocked: `propose_weights` then `apply_weights`
 //!   after `weight_delay` has elapsed.
 //! - Rounding dust from integer division is assigned to the first sink.
-//! - Fee-on-transfer tokens are supported: the router credits the amount it
-//!   actually received, not the amount the caller claimed to send.
+//! - Fee-on-transfer tokens are supported on both sides of the router: the
+//!   inbound `on_fee_received` path credits the amount actually received, and
+//!   the outbound `claim` path measures the sink's balance delta across the
+//!   transfer and credits only what the sink actually received (see issue
+//!   `#409` for the established balance-delta accounting pattern).
 //! - Account identifiers are length-bounded ([`MAX_SINK_ACCOUNT_LEN`] and
 //!   [`MAX_GOVERNANCE_ACCOUNT_LEN`]) so that an unbounded `String` cannot be
 //!   written into the router's storage maps. See
@@ -45,6 +48,17 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec,
 };
+
+/// Minimal token interface the router needs to perform real transfers.
+///
+/// In a Soroban deployment this is implemented over `token::Client`; in tests
+/// it is implemented by mock tokens (including fee-on-transfer tokens).
+pub trait TokenClient {
+    /// Current balance of `account`.
+    fn balance_of(&self, account: &str) -> u128;
+    /// Transfer `amount` from `from` to `to`. Returns `false` on failure.
+    fn transfer(&mut self, from: &str, to: &str, amount: u128) -> bool;
+}
 
 /// Total basis points that weights must sum to.
 pub const TOTAL_BPS: u32 = 10_000;
@@ -188,8 +202,17 @@ impl FeeRouter {
     /// Permissionlessly distribute the accumulated balance of `token` across
     /// the configured sinks according to their weights.
     ///
-    /// Rounding dust is assigned to the first sink so that the full balance is
-    /// always conserved.
+    /// # Trust assumption: first sink absorbs rounding dust
+    ///
+    /// Integer division of each sink's weighted share can leave a remainder.
+    /// Rather than burn it or introduce a dedicated dust sink, `distribute`
+    /// assigns the entire remainder to `sinks[0]` — whichever sink governance
+    /// most recently listed first in `propose_weights`. This is a deliberate,
+    /// governance-visible choice, not a bug: sink *ordering*, not just
+    /// weighting, carries a small economic effect (at most `sinks.len() - 1`
+    /// base units per distribution). Governance should therefore treat the
+    /// first position as a meaningful allocation and not reorder sinks
+    /// casually. The full balance is always conserved.
     pub fn distribute(env: Env, token: Address) -> Result<(), FeeRouterError> {
         let total: i128 = env
             .storage()
@@ -230,6 +253,13 @@ impl FeeRouter {
     /// The transfer is performed via the token contract. If the sink rejects
     /// the transfer the share is left claimable and the error is surfaced, so a
     /// later retry can succeed without affecting other sinks.
+    ///
+    /// Following the balance-delta accounting pattern (issue `#409`), the
+    /// sink's balance is read before and after the transfer and the router
+    /// credits only the amount actually received (`after - before`). For
+    /// fee-on-transfer tokens this is less than the nominal claimable amount,
+    /// and the router never over-credits. On success the claimable entry is
+    /// zeroed and the actually-received amount is returned.
     pub fn claim(env: Env, sink: Address, token: Address) -> Result<i128, FeeRouterError> {
         sink.require_auth();
         let key = DataKey::Claimable(sink.clone(), token.clone());
@@ -238,9 +268,12 @@ impl FeeRouter {
             return Err(FeeRouterError::NothingToClaim);
         }
         let client = token::Client::new(&env, &token);
+        let before = client.balance(&sink);
         client.transfer(&env.current_contract_address(), &sink, &amount);
+        let after = client.balance(&sink);
+        let received = after.saturating_sub(before);
         env.storage().persistent().set(&key, &0i128);
-        Ok(amount)
+        Ok(received)
     }
 
     /// Propose a new set of sinks and weights. Only governance may call this.
@@ -415,6 +448,49 @@ mod tests {
         assert_eq!(client.sinks().len(), 1);
     }
 
+    /// Mock token that can be configured to reject transfers or to skim a fee
+    /// on transfer (fee-on-transfer token).
+    struct MockToken {
+        balances: BTreeMap<String, u128>,
+        /// Fee in basis points deducted from the transferred amount.
+        fee_bps: u32,
+        /// When true, every transfer fails.
+        reject: bool,
+    }
+
+    impl MockToken {
+        fn new(fee_bps: u32, reject: bool) -> Self {
+            Self { balances: BTreeMap::new(), fee_bps, reject }
+        }
+
+        fn mint(&mut self, account: &str, amount: u128) {
+            let entry = self.balances.entry(account.to_string()).or_insert(0);
+            *entry = entry.saturating_add(amount);
+        }
+    }
+
+    impl TokenClient for MockToken {
+        fn balance_of(&self, account: &str) -> u128 {
+            self.balances.get(account).copied().unwrap_or(0)
+        }
+
+        fn transfer(&mut self, from: &str, to: &str, amount: u128) -> bool {
+            if self.reject {
+                return false;
+            }
+            let from_balance = self.balance_of(from);
+            if from_balance < amount {
+                return false;
+            }
+            let fee = amount.saturating_mul(self.fee_bps as u128) / TOTAL_BPS as u128;
+            let received = amount - fee;
+            self.balances.insert(from.to_string(), from_balance - amount);
+            let to_entry = self.balances.entry(to.to_string()).or_insert(0);
+            *to_entry = to_entry.saturating_add(received);
+            true
+        }
+    }
+
     #[test]
     fn rejected_transfer_keeps_share_claimable() {
         let (env, client, _gov, treasury, _b, _r) = setup();
@@ -437,5 +513,23 @@ mod tests {
         // A second claim with nothing left errors but does not affect others.
         let res = client.try_claim(&treasury, &token);
         assert_eq!(res, Err(Ok(FeeRouterError::NothingToClaim)));
+    }
+
+    #[test]
+    fn claim_credits_actual_received_for_fee_on_transfer_token() {
+        let mut r = FeeRouter::new("gov", 0, sinks()).unwrap();
+        r.on_fee_received("usd", 1_000);
+        r.distribute("usd").unwrap();
+        let nominal = r.claimable("treasury", "usd");
+        assert_eq!(nominal, 500);
+
+        // 10% fee-on-transfer token: sink receives 450 of the 500 sent.
+        let mut token = MockToken::new(1_000, false);
+        token.mint("gov", 1_000);
+
+        let credited = r.claim("treasury", "usd", &mut token).unwrap();
+        assert_eq!(credited, 450);
+        assert_eq!(token.balance_of("treasury"), 450);
+        assert_eq!(r.claimable("treasury", "usd"), 0);
     }
 }
