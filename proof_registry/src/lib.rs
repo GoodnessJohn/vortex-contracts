@@ -61,6 +61,21 @@ use soroban_sdk::{
 /// ledger-entry expiry.
 pub const PROOF_VALIDITY_WINDOW: u64 = 3600;
 
+/// Number of ledgers in a day, assuming ~5-second ledger close times.
+const DAY_IN_LEDGERS: u32 = 17_280;
+
+/// Storage-TTL archival thresholds (issue #51).  When an instance entry's
+/// remaining TTL drops below `INSTANCE_TTL_THRESHOLD` ledgers it is extended
+/// out to `INSTANCE_TTL_EXTEND_TO` ledgers.
+const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS;
+const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
+
+/// Storage-TTL archival thresholds for persistent `ProofRecord` entries
+/// (issue #51).  Proofs are kept well beyond `PROOF_VALIDITY_WINDOW` so that
+/// archival never races business-logic staleness.
+const PROOF_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS;
+const PROOF_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
+
 #[cfg(test)]
 mod test;
 
@@ -123,6 +138,9 @@ pub enum ProofKey {
     /// Authorized source address for a given Axelar source-chain name.
     /// Key: `chain_name: Symbol` → `source_address: String`.
     AuthorizedAxelarSource(Symbol),
+    /// Address permitted to configure per-chain emitter/source allowlists
+    /// (typically `intent_settlement`). Set via `set_configurator`.
+    Configurator,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -481,15 +499,15 @@ impl ProofRegistry {
         }
 
         // Decode src_chain_id (bytes 52..54) as big-endian u16 → u32.
-        let chain_hi = payload.get(52) as u32;
-        let chain_lo = payload.get(53) as u32;
+        let chain_hi = Self::byte(&env, &payload, 52) as u32;
+        let chain_lo = Self::byte(&env, &payload, 53) as u32;
         let src_chain_id: u32 = (chain_hi << 8) | chain_lo;
 
         // Decode src_amount (bytes 86..102) as big-endian i128.
         let mut amount_bytes = [0u8; 16];
         let mut idx = 0usize;
         while idx < 16 {
-            amount_bytes[idx] = payload.get((86 + idx) as u32) as u8;
+            amount_bytes[idx] = Self::byte(&env, &payload, 86 + idx as u32);
             idx += 1;
         }
         let src_amount = i128::from_be_bytes(amount_bytes);

@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env, Vec,
+};
 
 /// Storage keys for the treasury streams contract.
 #[contracttype]
@@ -14,11 +16,37 @@ pub enum DataKey {
     NextId,
     /// Per-stream record.
     Stream(u64),
+    /// Total number of streams ever created.
+    StreamCount,
+    /// Ids of streams created by a given sender.
+    SenderStreams(Address),
+    /// Ids of streams created for a given recipient.
+    RecipientStreams(Address),
     /// Circuit-breaker flag gating `create_stream` and `withdraw`.
     Paused,
 }
 
 /// A single payment stream.
+///
+/// # Vesting semantics for adjustments
+///
+/// A stream's `total` is always vested linearly across `start..end` (with the
+/// `cliff` gate), i.e. `vested_amount` is recomputed from the *current* `total`
+/// and `end` on every read. This makes the two governor-gated adjustment
+/// entrypoints well-defined:
+///
+/// * `top_up(stream_id, additional_amount)` escrows `additional_amount` from
+///   the stream's `sender` and adds it to `stream.total`. The newly added funds
+///   vest on the *same* schedule as the original: the whole new `total` is
+///   re-stretched across `start..end`. (If the stream has already ended, the
+///   full new total is immediately vested.)
+/// * `extend(stream_id, new_end)` sets `stream.end = new_end`, re-stretching
+///   the remaining unvested amount over the new (longer) duration. `new_end`
+///   must be `> start` and `>= end`; shortening is rejected with
+///   `InvalidSchedule` so already-vested funds can never be un-vested.
+///
+/// Both are governor-only (authority symmetric with `create_stream`/`cancel`)
+/// and are rejected once the stream is cancelled.
 #[contracttype]
 #[derive(Clone)]
 pub struct Stream {
@@ -45,7 +73,8 @@ pub enum Error {
     InvalidAmount = 6,
     NothingToWithdraw = 7,
     AlreadyCancelled = 8,
-    NoPendingGovernor = 9,
+    ArithmeticOverflow = 9,
+    NoPendingGovernor = 12,
     Paused = 10,
     NotPaused = 11,
 }
@@ -179,6 +208,28 @@ impl TreasuryStreams {
         env.storage().persistent().set(&DataKey::Stream(id), &stream);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
 
+        // Maintain enumeration indexes for paginated views.
+        let count: u64 = env.storage().instance().get(&DataKey::StreamCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::StreamCount, &(count + 1));
+
+        let sender_key = DataKey::SenderStreams(sender.clone());
+        let mut sender_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&sender_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        sender_ids.push_back(id);
+        env.storage().persistent().set(&sender_key, &sender_ids);
+
+        let recipient_key = DataKey::RecipientStreams(recipient.clone());
+        let mut recipient_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&recipient_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        recipient_ids.push_back(id);
+        env.storage().persistent().set(&recipient_key, &recipient_ids);
+
         env.events().publish(
             (soroban_sdk::symbol_short!("create"), id),
             (sender, recipient, token, total, start, cliff, end),
@@ -268,6 +319,81 @@ impl TreasuryStreams {
         Ok(())
     }
 
+    /// Adds `additional_amount` to an existing stream. Only the governor may
+    /// call this. The funds are pulled from the stream's `sender` into escrow
+    /// and the whole new `total` is re-stretched across the original
+    /// `start..end` schedule (see [`Stream`] docs for the vesting semantics).
+    pub fn top_up(env: Env, stream_id: u64, additional_amount: i128) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if additional_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Escrow the additional deposit before mutating state.
+        token::Client::new(&env, &stream.token).transfer(
+            &stream.sender,
+            &env.current_contract_address(),
+            &additional_amount,
+        );
+
+        stream.total += additional_amount;
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("top_up"), stream_id),
+            (stream.sender.clone(), additional_amount, stream.total),
+        );
+        Ok(())
+    }
+
+    /// Extends an existing stream's `end` to `new_end`. Only the governor may
+    /// call this. `new_end` must be `> start` and `>= end`; shortening is
+    /// rejected with `InvalidSchedule`. The remaining unvested amount is
+    /// re-stretched over the new duration (see [`Stream`] docs).
+    pub fn extend(env: Env, stream_id: u64, new_end: u64) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+
+        let mut stream: Stream = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stream(stream_id))
+            .ok_or(Error::StreamNotFound)?;
+        if stream.cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if new_end <= stream.start || new_end < stream.end {
+            return Err(Error::InvalidSchedule);
+        }
+
+        stream.end = new_end;
+        env.storage().persistent().set(&DataKey::Stream(stream_id), &stream);
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("extend"), stream_id),
+            (stream.sender.clone(), new_end, stream.total),
+        );
+        Ok(())
+    }
+
     /// Returns the currently withdrawable (vested but not yet withdrawn) balance.
     pub fn balance_of(env: Env, stream_id: u64) -> Result<i128, Error> {
         let stream: Stream = env
@@ -287,6 +413,55 @@ impl TreasuryStreams {
             .ok_or(Error::StreamNotFound)
     }
 
+    /// Returns the total number of streams ever created.
+    pub fn get_stream_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::StreamCount).unwrap_or(0)
+    }
+
+    /// Returns a page of stream ids created by `sender`, starting at `start`
+    /// with at most `limit` entries. Out-of-range `start` yields an empty page.
+    pub fn list_streams_by_sender(env: Env, sender: Address, start: u32, limit: u32) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SenderStreams(sender))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate(&env, &ids, start, limit)
+    }
+
+    /// Returns a page of stream ids created for `recipient`, starting at
+    /// `start` with at most `limit` entries. Out-of-range `start` yields an
+    /// empty page.
+    pub fn list_streams_by_recipient(
+        env: Env,
+        recipient: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecipientStreams(recipient))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate(&env, &ids, start, limit)
+    }
+
+    /// Slices `ids` into a page of at most `limit` entries beginning at `start`.
+    fn paginate(env: &Env, ids: &Vec<u64>, start: u32, limit: u32) -> Vec<u64> {
+        let mut page = Vec::new(env);
+        let len = ids.len();
+        if start >= len || limit == 0 {
+            return page;
+        }
+        let end = core::cmp::min(start.saturating_add(limit), len);
+        let mut i = start;
+        while i < end {
+            page.push_back(ids.get_unchecked(i));
+            i += 1;
+        }
+        page
+    }
+
     /// Loads the governor and requires its authorization.
     fn require_governor(env: &Env) -> Result<Address, Error> {
         let governor: Address = env
@@ -301,7 +476,7 @@ impl TreasuryStreams {
     /// Precision-safe vested amount: `total * elapsed / duration` using integer
     /// math. The final withdrawal sweeps any rounding dust because once
     /// `now >= end` the full `total` is considered vested.
-    fn vested_amount(stream: &Stream, now: u64) -> i128 {
+    pub(crate) fn vested_amount(stream: &Stream, now: u64) -> i128 {
         if now < stream.cliff {
             return 0;
         }
@@ -310,7 +485,14 @@ impl TreasuryStreams {
         }
         let duration = (stream.end - stream.start) as i128;
         let elapsed = (now - stream.start) as i128;
-        stream.total * elapsed / duration
+        match stream
+            .total
+            .checked_mul(elapsed)
+            .and_then(|n| n.checked_div(duration))
+        {
+            Some(vested) => vested,
+            None => panic_with_error!(&Env::default(), Error::ArithmeticOverflow),
+        }
     }
 }
 

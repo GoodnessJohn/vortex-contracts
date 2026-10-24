@@ -22,6 +22,15 @@
 //! verify which core they are reading from, and so the periphery can be pointed
 //! at a testnet or a new core address without re-deploying.
 //!
+//! ## Interface-version handshake (issue #560)
+//!
+//! Cooperating contracts expose `get_interface_version() -> u32`. Callers that
+//! depend on cross-contract calls verify the callee's version once, at
+//! configuration time (`initialize` / `set_settlement`), rather than on every
+//! call — so a post-upgrade mismatch is caught immediately without adding
+//! per-call overhead. `INTERFACE_VERSION` is the value this periphery expects
+//! from the core settlement contract.
+//!
 //! ## Reentrancy note
 //!
 //! All functions here are read-only (no token transfers, no storage writes on
@@ -46,8 +55,17 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    IntoVal, Map, Symbol, Val, Vec,
+    IntoVal, Map, String, Symbol, Val, Vec,
 };
+
+// ─── Interface version ────────────────────────────────────────────────────────
+
+/// Interface version this periphery expects from the core settlement contract.
+///
+/// Bump this whenever the cross-contract ABI used by the proxies below changes
+/// in a way that is not backward compatible. The handshake in `initialize` and
+/// `set_settlement` rejects a core that reports a different value.
+pub const INTERFACE_VERSION: u32 = 1;
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -68,7 +86,8 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
-    NoPendingSettlement = 4,
+    InterfaceVersionMismatch = 4,
+    NoPendingSettlement = 5,
 }
 
 // ─── Batched view payloads ────────────────────────────────────────────────────
@@ -89,11 +108,15 @@ impl IntentPeriphery {
     // ── Initialization ────────────────────────────────────────────────────────
 
     /// One-time setup: record admin and the core settlement contract address.
+    ///
+    /// Performs the interface-version handshake against `settlement` before
+    /// persisting it, so a mismatched core is rejected at configuration time.
     pub fn initialize(env: Env, admin: Address, settlement: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
         admin.require_auth();
+        Self::verify_interface_version(&env, &settlement);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -112,6 +135,9 @@ impl IntentPeriphery {
     /// see closed issue #118). This gives operators a visibility window in
     /// which a mistaken or compromised proposal can be noticed before it
     /// redirects every proxy view in this contract.
+    ///
+    /// Performs the interface-version handshake against `settlement` before
+    /// persisting it, so a mismatched core is rejected at configuration time.
     pub fn propose_settlement(env: Env, settlement: Address) {
         let admin: Address = env
             .storage()
@@ -119,6 +145,7 @@ impl IntentPeriphery {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         admin.require_auth();
+        Self::verify_interface_version(&env, &settlement);
         env.storage()
             .instance()
             .set(&DataKey::PendingSettlement, &settlement);
@@ -157,6 +184,14 @@ impl IntentPeriphery {
     /// Return the proposed-but-not-yet-accepted settlement address, if any.
     pub fn get_pending_settlement(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingSettlement)
+    }
+
+    /// Interface-version handshake view (issue #560).
+    ///
+    /// Cooperating contracts expose this so callers can verify compatibility
+    /// once at configuration time. Returns the version this periphery speaks.
+    pub fn get_interface_version(_env: Env) -> u32 {
+        INTERFACE_VERSION
     }
 
     // ── Heavy view proxies (issue #376) ───────────────────────────────────────
@@ -398,6 +433,21 @@ impl IntentPeriphery {
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
+
+    /// Query `settlement.get_interface_version()` and reject a mismatch.
+    ///
+    /// Called only at configuration time (`initialize` / `propose_settlement`)
+    /// so the extra cross-contract call is paid once, not on every proxy call.
+    fn verify_interface_version(env: &Env, settlement: &Address) {
+        let version: u32 = env.invoke_contract(
+            settlement,
+            &Symbol::new(env, "get_interface_version"),
+            Vec::new(env),
+        );
+        if version != INTERFACE_VERSION {
+            panic_with_error!(env, Error::InterfaceVersionMismatch);
+        }
+    }
 
     fn load_settlement(env: &Env) -> Address {
         env.storage()

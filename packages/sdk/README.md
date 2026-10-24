@@ -130,18 +130,16 @@ See [`src/types.ts`](./src/types.ts) for full documentation.
 
 ## Status
 
-This SDK is currently in **reference implementation** status. The method signatures are defined and fully typed, but transaction construction and submission logic is not yet implemented. This serves as:
+This SDK is **functional**: every method performs a real call against the `intent_settlement` contract via Soroban RPC.
 
-1. **Integration specification** — Defines what a production SDK must do
-2. **Type reference** — Provides TypeScript types for use with other Soroban tooling
-3. **Documentation** — Each method's JSDoc shows the intended semantics
+- **Read-only queries** (`getIntent`, `getSolver`, `listOpenIntents`, `getConfig`, `isPaused`, `isSolverEligible`, etc.) are executed as simulated contract invocations and return decoded results.
+- **State-changing operations** (`submitIntent`, `acceptIntent`, `fillIntent`, `registerSolver`, admin operations, etc.) build a Soroban `Contract` invocation, prepare it via RPC (fee and footprint estimation), sign it with the supplied keypair, submit it, and poll for the result.
+- Failures surface as real, meaningful errors (simulation failures, submission errors, and contract errors) rather than unconditional stub exceptions.
 
-Production SDKs should:
-- Implement transaction construction using `Contract` and `Operation` from `stellar-sdk`
-- Add retry logic and error handling
-- Support fee estimation and transaction envelope customization
-- Provide event subscription and filtering helpers
-- Include comprehensive tests
+Potential future enhancements:
+- Retry logic and backoff for transient RPC failures
+- Event subscription and filtering helpers
+- Additional coverage for other contracts (`governor`, `backstop_vault`, etc.)
 
 ## Development
 
@@ -152,7 +150,7 @@ npm install
 # Build
 npm run build
 
-# Run tests (once test suite is added)
+# Run tests
 npm test
 
 # Lint
