@@ -20,6 +20,27 @@ const RUST_FILE = path.resolve(
   __dirname,
   "../../intent_settlement/src/lib.rs"
 );
+
+// Additional contract crates whose Rust definitions must stay in sync with
+// types/src/index.ts. Add `{ name, rustFile, patterns }` entries here.
+const EXTRA_TARGETS = [
+  {
+    name: "solver_registry",
+    rustFile: path.resolve(__dirname, "../../solver_registry/src/lib.rs"),
+    patterns: [
+      [/pub struct SolverRecord\s*\{/, "SolverRecord struct"],
+      ...[
+        "address",
+        "bond_amount",
+        "fills_completed",
+        "fills_failed",
+        "total_volume",
+        "registered_at",
+        "last_slash_time",
+      ].map((f) => [new RegExp(`pub ${f}:`), `SolverRecord.${f}`]),
+    ],
+  },
+];
 const TS_FILE = path.resolve(__dirname, "../src/index.ts");
 
 // Rust sources for the five newest contracts (issue #482).
@@ -324,6 +345,19 @@ importantErrors.forEach((error) => {
     new RegExp(`${error}\\s*=\\s*\\d+`),
     `ErrorCode.${error} in TS`
   );
+});
+
+// Additional crates
+EXTRA_TARGETS.forEach(({ name, rustFile, patterns }) => {
+  console.log(`\n${name}:`);
+  patterns.forEach(([pattern, description]) => {
+    checkRustPattern(pattern, `${description} in Rust (${name})`, rustFile);
+    // Fields must also appear in the TS definitions
+    if (!description.includes("struct")) {
+      const field = description.split(".").pop();
+      checkTsPattern(new RegExp(`${field}[:\\?]`), `${description} in TS (${name})`);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
