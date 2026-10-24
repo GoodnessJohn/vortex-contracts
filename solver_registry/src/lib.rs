@@ -215,6 +215,9 @@ pub enum Error {
     AdminTimelockNotElapsed = 17,
     /// `accept_admin` / `cancel_admin_transfer` with no handover pending.
     NoPendingAdminTransfer = 18,
+    /// `unstake` / `deregister_solver` attempted while the solver still holds
+    /// open obligations in settlement (issue #542).
+    OpenObligations = 19,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -571,10 +574,22 @@ impl SolverRegistry {
 
     /// Withdraw `amount` of bond. The remaining balance must still clear the
     /// tier-0 floor — use [`SolverRegistry::deregister_solver`] to exit fully.
+    ///
+    /// **Obligation policy (issue #542):** *any* unstake is rejected with
+    /// [`Error::OpenObligations`] while the solver holds one or more open
+    /// obligations in settlement (`get_open_obligations(solver) > 0`). Partial
+    /// unstaking while obligated is deliberately **not** allowed: the bond is
+    /// the collateral backing every open obligation, so reducing it — even to
+    /// a level that still clears the tier-0 floor — could leave those
+    /// obligations under-collateralised. The solver must wait for settlement
+    /// to release its obligations before withdrawing any bond.
     pub fn unstake(env: Env, solver: Address, amount: i128) {
         solver.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
+        }
+        if Self::open_obligations(&env, &solver) > 0 {
+            panic_with_error!(&env, Error::OpenObligations);
         }
         let mut record = Self::load_solver(&env, &solver);
         if amount > record.bond_amount {
@@ -601,8 +616,15 @@ impl SolverRegistry {
 
     /// Exit the registry: returns the full remaining bond and deletes the
     /// record.
+    ///
+    /// Rejected with [`Error::OpenObligations`] while the solver holds any
+    /// open obligations in settlement (issue #542): deregistering would
+    /// return the collateral backing them.
     pub fn deregister_solver(env: Env, solver: Address) {
         solver.require_auth();
+        if Self::open_obligations(&env, &solver) > 0 {
+            panic_with_error!(&env, Error::OpenObligations);
+        }
         let record = Self::load_solver(&env, &solver);
 
         env.storage()
