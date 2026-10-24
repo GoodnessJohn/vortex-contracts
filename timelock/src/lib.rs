@@ -96,6 +96,11 @@ const ROLE_KEY: Symbol = symbol_short!("Role");
 /// Default grace period after `ready_at` during which an operation may execute.
 const DEFAULT_GRACE_PERIOD: u64 = 14 * 24 * 60 * 60;
 
+/// Number of ledgers below which a persistent entry's TTL is bumped on write.
+const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
+/// Number of ledgers a persistent entry's TTL is extended to on write.
+const PERSISTENT_TTL_EXTEND_TO: u32 = 500_000;
+
 #[contract]
 pub struct TimelockController;
 
@@ -132,6 +137,19 @@ impl TimelockController {
     }
 
     // ---------------------------------------------------------------------
+    // TTL helpers
+    // ---------------------------------------------------------------------
+
+    /// Bump the TTL of a persistent storage key so it does not get archived.
+    fn bump_persistent_ttl<K: soroban_sdk::IntoVal<Env, Val>>(env: &Env, key: &K) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // Role management (must be authorised by the timelock itself)
     // ---------------------------------------------------------------------
 
@@ -142,9 +160,9 @@ impl TimelockController {
 
     pub fn revoke_role(env: Env, role: Symbol, account: Address) {
         Self::require_admin(&env);
-        env.storage()
-            .persistent()
-            .set(&(ROLE_KEY, role, account), &false);
+        let key = (ROLE_KEY, role, account);
+        env.storage().persistent().set(&key, &false);
+        Self::bump_persistent_ttl(&env, &key);
     }
 
     pub fn has_role(env: Env, role: Symbol, account: Address) -> bool {
@@ -239,9 +257,9 @@ impl TimelockController {
             executed: false,
         };
 
-        env.storage()
-            .persistent()
-            .set(&(OP_KEY, id.clone()), &operation);
+        let op_key = (OP_KEY, id.clone());
+        env.storage().persistent().set(&op_key, &operation);
+        Self::bump_persistent_ttl(&env, &op_key);
 
         env.events()
             .publish((symbol_short!("scheduled"), id.clone()), id.clone());

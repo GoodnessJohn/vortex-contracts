@@ -30,6 +30,12 @@ use vortex_common::require_admin;
 /// the checkpoint history stays cheap and storage stays predictable.
 pub const MAX_CHECKPOINTS: u32 = 64;
 
+/// Persistent entries are bumped once their remaining TTL drops below this
+/// many ledgers, extending them back out to `PERSISTENT_TTL_EXTEND_TO`.
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
+/// Target TTL (in ledgers) for persistent entries after a bump.
+pub const PERSISTENT_TTL_EXTEND_TO: u32 = 1_000_000;
+
 /// Maximum number of proposals returned by a single `list_proposals` call.
 pub const MAX_LIST_LIMIT: u32 = 50;
 
@@ -266,7 +272,9 @@ impl Governor {
             function,
             calldata,
         };
-        env.storage().persistent().set(&Self::proposal_key(&env, id), &proposal);
+        let proposal_key = Self::proposal_key(&env, id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent_ttl(&env, &proposal_key);
         env.storage().instance().set(&Symbol::new(&env, "count"), &(id + 1));
         env.events().publish(
             (symbol_short!("propose"),),
@@ -364,7 +372,10 @@ impl Governor {
             }
         }
         env.storage().persistent().set(&vote_key, &power);
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        Self::bump_persistent_ttl(&env, &vote_key);
+        let proposal_key = Self::proposal_key(&env, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent_ttl(&env, &proposal_key);
         env.events().publish(
             (symbol_short!("vote"),),
             (proposal_id, voter.clone(), support, power),
@@ -393,7 +404,9 @@ impl Governor {
             (proposal.target.clone(), proposal.function.clone(), args, eta).into_val(&env),
         );
         proposal.eta = eta;
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        let proposal_key = Self::proposal_key(&env, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent_ttl(&env, &proposal_key);
         env.events()
             .publish((symbol_short!("queue"),), (proposal_id, proposal.eta));
         Ok(())
@@ -426,7 +439,9 @@ impl Governor {
                 .into_val(&env),
         );
         proposal.executed = true;
-        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        let proposal_key = Self::proposal_key(&env, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_persistent_ttl(&env, &proposal_key);
         env.events().publish(
             (symbol_short!("execute"),),
             (proposal_id, proposal.target.clone(), proposal.function.clone()),
@@ -646,6 +661,13 @@ impl Governor {
         } else {
             checkpoints.get(low - 1).unwrap().power
         }
+    }
+
+    /// Extend the TTL of a persistent entry if it is close to expiring.
+    fn bump_persistent_ttl(env: &Env, key: &impl soroban_sdk::IntoVal<Env, Val>) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
     }
 
     /// Compute a proposal's deadline, guarding against ledger overflow.
