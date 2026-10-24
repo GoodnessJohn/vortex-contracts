@@ -5,6 +5,12 @@
 #   ./scripts/check-deployment.sh <CONTRACT_ID>              # check on mainnet
 #   ./scripts/check-deployment.sh <CONTRACT_ID> testnet      # check on testnet
 #
+#   # Check the five wave contracts as well (governor, backstop_vault,
+#   # fee_router, intent_periphery, treasury_streams). Contract IDs may be
+#   # supplied via environment variables or an env file produced by
+#   # setup-local-network.sh (default: .local-network.env in the repo root).
+#   ./scripts/check-deployment.sh <CONTRACT_ID> testnet --env-file .local-network.env
+#
 # This script performs a quick deployment health overview by querying the
 # contract's key state values. All queries are read-only (no fees, no side
 # effects).
@@ -26,11 +32,48 @@ die()  { echo "[check-deployment] ERROR: $*" >&2; exit 1; }
 # Argument validation
 # ---------------------------------------------------------------------------
 if [[ $# -lt 1 ]]; then
-  die "Usage: check-deployment.sh <CONTRACT_ID> [NETWORK]"
+  die "Usage: check-deployment.sh <CONTRACT_ID> [NETWORK] [--env-file <PATH>]"
 fi
 
 CONTRACT_ID="$1"
 NETWORK="${2:-mainnet}"
+
+# Optional --env-file argument (may appear anywhere after the first two args).
+ENV_FILE=""
+shift $(( $# >= 2 ? 2 : 1 ))
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --env-file)
+      [[ $# -ge 2 ]] || die "--env-file requires a path argument"
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+# Load contract IDs for the wave contracts. Precedence: explicit environment
+# variables win over values from the env file.
+if [[ -z "${ENV_FILE}" && -f ".local-network.env" ]]; then
+  ENV_FILE=".local-network.env"
+fi
+if [[ -n "${ENV_FILE}" ]]; then
+  [[ -f "${ENV_FILE}" ]] || die "Env file not found: ${ENV_FILE}"
+  info "Loading contract IDs from ${ENV_FILE}"
+  # shellcheck disable=SC1090
+  set -a
+  source "${ENV_FILE}"
+  set +a
+fi
+
+# Contract IDs for the wave contracts (empty means "not configured").
+GOVERNOR_ID="${GOVERNOR_ID:-}"
+BACKSTOP_VAULT_ID="${BACKSTOP_VAULT_ID:-}"
+FEE_ROUTER_ID="${FEE_ROUTER_ID:-}"
+INTENT_PERIPHERY_ID="${INTENT_PERIPHERY_ID:-}"
+TREASURY_STREAMS_ID="${TREASURY_STREAMS_ID:-}"
 
 # Validate CONTRACT_ID format (Stellar contract IDs start with 'C')
 if [[ ! "${CONTRACT_ID}" =~ ^C[A-Z0-9]{55}$ ]]; then
@@ -100,6 +143,88 @@ if result=$(stellar contract invoke "${STELLAR_ARGS[@]}" -- get_stats 2>&1); the
   echo "${result}"
 else
   die "Query failed for get_stats: ${result}"
+fi
+
+# ---------------------------------------------------------------------------
+# Wave contracts health checks
+# ---------------------------------------------------------------------------
+# Helper to query a view on an arbitrary contract ID. Fails hard on error.
+query_contract_view() {
+  local contract_id="$1"
+  local view_name="$2"
+  local label="$3"
+
+  echo -n "${label}: "
+  if result=$(stellar contract invoke \
+      --id "${contract_id}" \
+      --network "${NETWORK}" \
+      ${SOURCE_KEY:+--source "${SOURCE_KEY}"} \
+      -- "${view_name}" 2>&1); then
+    echo "${result}"
+  else
+    die "Query failed for ${label} (${view_name} on ${contract_id}): ${result}"
+  fi
+}
+
+# Helper to validate a contract ID supplied for a wave contract.
+require_contract_id() {
+  local var_name="$1"
+  local value="$2"
+  if [[ -z "${value}" ]]; then
+    die "Missing ${var_name}. Set it in the environment or via --env-file (see setup-local-network.sh)."
+  fi
+  if [[ ! "${value}" =~ ^C[A-Z0-9]{55}$ ]]; then
+    die "Invalid ${var_name} format: ${value}"
+  fi
+}
+
+check_wave_contracts() {
+  echo ""
+  echo "=== Wave Contracts — Deployment Health Check ==="
+  echo ""
+
+  # --- governor -----------------------------------------------------------
+  require_contract_id "GOVERNOR_ID" "${GOVERNOR_ID}"
+  echo "--- Governor (${GOVERNOR_ID}) ---"
+  query_contract_view "${GOVERNOR_ID}" "get_config" "Config"
+  query_contract_view "${GOVERNOR_ID}" "get_admin" "Admin"
+  query_contract_view "${GOVERNOR_ID}" "is_paused" "Paused"
+
+  # --- backstop_vault -----------------------------------------------------
+  require_contract_id "BACKSTOP_VAULT_ID" "${BACKSTOP_VAULT_ID}"
+  echo ""
+  echo "--- Backstop Vault (${BACKSTOP_VAULT_ID}) ---"
+  query_contract_view "${BACKSTOP_VAULT_ID}" "get_admin" "Admin"
+  query_contract_view "${BACKSTOP_VAULT_ID}" "get_settlement" "Settlement"
+
+  # --- fee_router ---------------------------------------------------------
+  require_contract_id "FEE_ROUTER_ID" "${FEE_ROUTER_ID}"
+  echo ""
+  echo "--- Fee Router (${FEE_ROUTER_ID}) ---"
+  query_contract_view "${FEE_ROUTER_ID}" "get_admin" "Admin"
+  query_contract_view "${FEE_ROUTER_ID}" "get_weights" "Weights"
+
+  # --- intent_periphery ---------------------------------------------------
+  require_contract_id "INTENT_PERIPHERY_ID" "${INTENT_PERIPHERY_ID}"
+  echo ""
+  echo "--- Intent Periphery (${INTENT_PERIPHERY_ID}) ---"
+  query_contract_view "${INTENT_PERIPHERY_ID}" "is_initialized" "Initialized"
+  query_contract_view "${INTENT_PERIPHERY_ID}" "get_admin" "Admin"
+
+  # --- treasury_streams ---------------------------------------------------
+  require_contract_id "TREASURY_STREAMS_ID" "${TREASURY_STREAMS_ID}"
+  echo ""
+  echo "--- Treasury Streams (${TREASURY_STREAMS_ID}) ---"
+  query_contract_view "${TREASURY_STREAMS_ID}" "get_admin" "Admin"
+  query_contract_view "${TREASURY_STREAMS_ID}" "get_stream_count" "Stream Count"
+}
+
+# Only run the wave checks when at least one wave contract ID is configured.
+if [[ -n "${GOVERNOR_ID}${BACKSTOP_VAULT_ID}${FEE_ROUTER_ID}${INTENT_PERIPHERY_ID}${TREASURY_STREAMS_ID}" ]]; then
+  check_wave_contracts
+else
+  info "No wave contract IDs configured; skipping governor/backstop_vault/fee_router/intent_periphery/treasury_streams checks."
+  info "Provide them via environment variables or --env-file to enable these checks."
 fi
 
 echo ""

@@ -19,6 +19,7 @@ lto = true
 
 [dependencies]
 soroban-sdk = { version = "21.0.0" }
+vortex-common = { path = "../vortex-common" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }

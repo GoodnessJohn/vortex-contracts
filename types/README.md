@@ -61,6 +61,37 @@ try {
 - **`ErrorCode`** — Complete error code enumeration
 - **`ErrorMessages`** — Map of error codes to human-readable messages
 
+#### Governor (`governor`)
+
+- **`Proposal`** — A governance proposal with its votes and execution state
+- **`ProposalState`** — Enum of proposal lifecycle states
+- **`VoteType`** — Enum of vote choices (for/against/abstain)
+- **`GovernorConfig`** — Governor configuration (voting period, quorum, thresholds)
+
+#### Backstop Vault (`backstop_vault`)
+
+- **`BackstopVaultConfig`** — Vault configuration (capacity, cooldown, share pricing)
+- **`BackstopDeposit`** — A depositor's position in the backstop vault
+- **`BackstopVaultState`** — Enum of vault lifecycle states
+
+#### Fee Router (`fee_router`)
+
+- **`Sink`** — A fee recipient with its routing weight
+- **`FeeRouterConfig`** — Fee router configuration (sinks and split parameters)
+- **`FeeDistribution`** — A recorded fee distribution across sinks
+
+#### Treasury Streams (`treasury_streams`)
+
+- **`Stream`** — A token stream (recipient, rate, start/end, claimed amount)
+- **`StreamState`** — Enum of stream lifecycle states
+- **`TreasuryStreamsConfig`** — Treasury streams configuration (limits, cliff defaults)
+
+#### Intent Periphery (`intent_periphery`)
+
+- **`PeripheryIntent`** — An intent submitted through the periphery contract
+- **`PeripheryConfig`** — Periphery configuration (allowed tokens, fee parameters)
+- **`PeripheryIntentState`** — Enum of periphery intent lifecycle states
+
 ### Error Handling
 
 ```typescript
@@ -73,13 +104,20 @@ console.log(message); // "Solver bond is below minimum"
 
 ## Drift Detection
 
-Types are generated from Rust definitions in `intent_settlement/src/lib.rs`. A CI check (`check-drift`) ensures TypeScript types stay synchronized:
+Types are derived from the Rust `#[contracttype]` definitions in each contract's `lib.rs`. A CI check (`check-drift`) ensures TypeScript types stay synchronized across all six contracts:
+
+- `intent_settlement`
+- `governor`
+- `backstop_vault`
+- `fee_router`
+- `treasury_streams`
+- `intent_periphery`
 
 ```bash
 npm run check-drift
 ```
 
-This verifies:
+This verifies, for every covered contract:
 - All struct fields exist in both Rust and TypeScript
 - All enum variants are present
 - Type names match exactly
@@ -123,7 +161,7 @@ Types version tracks the `intent_settlement` contract version. When contract typ
 
 When updating contract types in Rust:
 
-1. Modify `intent_settlement/src/lib.rs`
+1. Modify the relevant contract's `lib.rs` (`intent_settlement`, `governor`, `backstop_vault`, `fee_router`, `treasury_streams`, or `intent_periphery`)
 2. Update corresponding types in `types/src/index.ts`
 3. Run `npm run check-drift` to verify parity
 4. Update `types/` version in `package.json`
@@ -133,6 +171,11 @@ When updating contract types in Rust:
 
 - [Vortex Protocol](https://github.com/vortex-protocol)
 - [Intent Settlement Contract](../intent_settlement/)
+- [Governor Contract](../governor/)
+- [Backstop Vault Contract](../backstop_vault/)
+- [Fee Router Contract](../fee_router/)
+- [Treasury Streams Contract](../treasury_streams/)
+- [Intent Periphery Contract](../intent_periphery/)
 - [Solver Integration Guide](../docs/solver-integration-guide.md)
 
 ## License

@@ -2,11 +2,11 @@
 
 ## Overview
 
-This document describes an off-chain community-nomination and -endorsement process that informs (without technically binding) the admin's on-chain arbiter appointment decisions. It is the next step toward decentralization of the arbiter role beyond issue #42's initial admin-appointed committee, while explicitly stopping short of full trustless on-chain election infrastructure (which is deferred as a separate, larger effort).
+This document describes an off-chain community-nomination and -endorsement process that informs (without technically binding) the admin's on-chain arbiter appointment decisions. It is the next step toward decentralization of the arbiter role beyond the current single-admin arbiter model, while explicitly stopping short of full trustless on-chain election infrastructure (which is deferred as a separate, larger effort).
 
 **Scope & Governance Context:**
 
-- **Issue #42** established the on-chain arbiter registry and admin-appointment mechanism (initially admin-rotatable; upgradeable to multisig or separate contract)
+- **No on-chain arbiter registry or panel contract currently exists.** Dispute resolution still runs on plain `require_admin`; `intent_settlement` contains only a scaffolded `DataKey::Arbiter` storage slot and `Error::NotArbiter` variant that are not yet used in the authorization check. The on-chain arbiter panel is tracked by the `arbiter_panel` implementation issue (issue #95 in this batch; see also issue #407)
 - **This issue (#309)** designs the off-chain process that informs appointment decisions
 - **Issue #115** defines eligibility/conflict-of-interest criteria for arbiters (referenced and reused here)
 - **Issue #120** defines a community-signaling tool that this process reuses for the community-endorsement phase
@@ -80,7 +80,7 @@ This document describes an off-chain community-nomination and -endorsement proce
 
 **Transition:** 30 days before a seat expires, the nomination period for that seat opens again.
 
-**Mid-term removal:** If an arbiter becomes ineligible (new conflict of interest, extended absence), the admin or governance group may trigger a special election or temporary rotation per the arbiter registry contract (issue #42).
+**Mid-term removal:** If an arbiter becomes ineligible (new conflict of interest, extended absence), the admin or governance group may trigger a special election or temporary rotation per the arbiter panel contract (tracked by the `arbiter_panel` implementation issue, #95 in this batch; see also issue #407).
 
 ---
 
@@ -162,7 +162,7 @@ Week 7 (Feb 23)
           - Examples: "Carol disclosed late conflict of interest" or "Concerns raised in discussion suggest elevated risk"
           
      Decision published in governance update (March 1)
-     On-chain appointments via issue #42's registry (March 1–7)
+     On-chain appointments via the arbiter panel contract (issue #95; March 1–7)
 
 March 31
   └─ New committee takes office
@@ -236,14 +236,14 @@ This process depends on the following being completed or planned:
 
 | Dependency | Status | Role |
 |-----------|--------|---|
-| Issue #42: Arbiter registry contract | Assumed shipped | Provides on-chain registry for appointments |
+| Arbiter panel contract (issue #95; see also #407) | **Not shipped** — no on-chain arbiter registry/panel exists; `resolve_dispute` still uses `require_admin`, with only a scaffolded `DataKey::Arbiter`/`Error::NotArbiter` in `intent_settlement` | Would provide on-chain registry for appointments |
 | Issue #115: Arbiter code-of-conduct | Assumed shipped | Defines eligibility criteria reused here |
 | Issue #120: Community-signaling tool | Assumed shipped, interim OK | Enables community endorsement voting |
 | Governance group (Issue #117) | Assumed seated | Makes final appointment decisions |
 
 **If dependencies are not met:**
 
-- **#42 not shipped:** This process cannot operate (no registry to appoint to). Document this as a blocker.
+- **Arbiter panel contract (#95) not shipped:** This process cannot operate as designed (no on-chain registry to appoint to); today the admin address is the sole arbiter. Document this as a blocker and track progress on the `arbiter_panel` implementation issue (#95; see also #407).
 - **#115 not finalized:** Use preliminary eligibility criteria in first cycle; rebase on #115 once finalized.
 - **#120 not shipped:** Use interim signaling mechanism (GitHub Discussion) per Edge Case #5.
 - **Governance group not seated:** Admin unilaterally appoints; next cycle awaits governance (issue #117) setup.
@@ -294,7 +294,7 @@ All arbiter nomination cycles are archived:
 |-------|-------|----------|---|---|---|
 | Q1 2026 | 3 | Alice, Bob, Carol | Alice (320 votes) | Alice | Reconfirmed |
 | Q1 2026 | | | Bob (210 votes) | Bob | New, community-endorsed |
-| Q1 2026 | | | Carol (100 votes) | Resigned; David | Carol unavailable; #42 mid-term appt |
+| Q1 2026 | | | Carol (100 votes) | Resigned; David | Carol unavailable; #95 mid-term appt |
 
 ### Frequency of Cycles
 
@@ -307,7 +307,7 @@ All arbiter nomination cycles are archived:
 
 ### vs. Formal On-Chain Election (Deferred)
 
-This process is intentionally **off-chain and advisory**. A full on-chain election (where community votes are code-enforced) is deferred as a separate effort (issue #42 notes this as future work). That effort would require:
+This process is intentionally **off-chain and advisory**. A full on-chain election (where community votes are code-enforced) is deferred as a separate effort (the `arbiter_panel` implementation issue, #95, and issue #407 note this as future work). That effort would require:
 
 - Governance token or stake-weighted voting
 - Trustless vote-counting on-chain
@@ -362,17 +362,17 @@ A: That is out of scope for this election process. See issue #115 (arbiter code-
 ## Roadmap
 
 1. **Now:** Document this process (this file)
-2. **Pending issue #42:** Once arbiter registry ships, conduct first nomination cycle (pilot)
+2. **Pending issue #95 (arbiter panel contract):** Once the on-chain arbiter panel ships, conduct first nomination cycle (pilot)
 3. **Pilot cycle:** Run nomination, signaling, and appointment for 1–2 committee seats to validate process
 4. **Learnings:** Document any bottlenecks or community feedback; adjust process for next cycle if needed
 5. **Ongoing:** Execute regular nomination cycles on fixed schedule (annual or per governance decision)
-6. **Future:** As issue #42 upgrades to multisig or on-chain voting, evolve this process or replace it with full trustless election
+6. **Future:** As the arbiter panel contract (issue #95; see also #407) upgrades to multisig or on-chain voting, evolve this process or replace it with full trustless election
 
 ---
 
 ## References
 
-- **Issue #42**: Arbiter registry contract (on-chain mechanism)
+- **Issue #95**: `arbiter_panel` implementation (on-chain arbiter panel contract; see also issue #407)
 - **Issue #115**: Arbiter code-of-conduct and eligibility criteria (referenced for screening)
 - **Issue #120**: Community-signaling tool (mechanism for endorsement voting)
 - **Issue #112**: RFC process (escalation path for process changes)
