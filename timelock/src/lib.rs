@@ -230,7 +230,7 @@ impl TimelockController {
             env.panic_with_error(TimelockError::InsufficientDelay);
         }
 
-        let id = Self::hash_operation(&env, &calls, &predecessor, &salt);
+        let id = Self::hash_operation(env.clone(), calls.clone(), predecessor.clone(), salt.clone());
 
         if env.storage().persistent().has(&(OP_KEY, id.clone())) {
             env.panic_with_error(TimelockError::AlreadyScheduled);
@@ -262,6 +262,192 @@ impl TimelockController {
         Self::bump_persistent_ttl(&env, &op_key);
 
         env.events()
-            .publish((symbol_short!("scheduled"), id.clone()), 
+            .publish((symbol_short!("scheduled"), id.clone()), id.clone());
 
-/* … truncated 5970 chars — edit only what you need near the top … */
+        id
+    }
+
+    // ---------------------------------------------------------------------
+    // Cancellation
+    // ---------------------------------------------------------------------
+
+    pub fn cancel(env: Env, id: BytesN<32>) {
+        Self::require_role(&env, &CANCELLER);
+        let mut operation: Operation = env
+            .storage()
+            .persistent()
+            .get(&(OP_KEY, id.clone()))
+            .unwrap_or_else(|| env.panic_with_error(TimelockError::UnknownOperation));
+
+        if operation.executed {
+            env.panic_with_error(TimelockError::AlreadyDone);
+        }
+
+        operation.executed = true;
+        env.storage()
+            .persistent()
+            .set(&(OP_KEY, id.clone()), &operation);
+
+        env.events()
+            .publish((symbol_short!("cancelled"), id), ());
+    }
+
+    // ---------------------------------------------------------------------
+    // Execution
+    // ---------------------------------------------------------------------
+
+    pub fn execute(env: Env, id: BytesN<32>) {
+        Self::require_role(&env, &EXECUTOR);
+
+        let mut operation: Operation = env
+            .storage()
+            .persistent()
+            .get(&(OP_KEY, id.clone()))
+            .unwrap_or_else(|| env.panic_with_error(TimelockError::UnknownOperation));
+
+        if operation.executed {
+            env.panic_with_error(TimelockError::AlreadyDone);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < operation.ready_at {
+            env.panic_with_error(TimelockError::NotReady);
+        }
+        if now > operation.expires_at {
+            env.panic_with_error(TimelockError::Expired);
+        }
+
+        // Verify the stored operation still matches its committed hash.
+        let recomputed = Self::hash_operation(
+            env.clone(),
+            operation.calls.clone(),
+            operation.predecessor.clone(),
+            operation.salt.clone(),
+        );
+        if recomputed != id {
+            env.panic_with_error(TimelockError::UnknownOperation);
+        }
+
+        // Predecessor must be executed before this operation can run.
+        if operation.predecessor != Self::zero_hash(&env) {
+            let pred: Operation = env
+                .storage()
+                .persistent()
+                .get(&(OP_KEY, operation.predecessor.clone()))
+                .unwrap_or_else(|| env.panic_with_error(TimelockError::InvalidPredecessor));
+            if !pred.executed {
+                env.panic_with_error(TimelockError::UnmetPredecessor);
+            }
+        }
+
+        operation.executed = true;
+        env.storage()
+            .persistent()
+            .set(&(OP_KEY, id.clone()), &operation);
+
+        for call in operation.calls.iter() {
+            env.invoke_contract::<Val>(&call.target, &call.function, call.args.clone());
+        }
+
+        env.events()
+            .publish((symbol_short!("executed"), id), ());
+    }
+
+    // ---------------------------------------------------------------------
+    // Views
+    // ---------------------------------------------------------------------
+
+    pub fn get_operation_state(env: Env, id: BytesN<32>) -> OperationState {
+        let operation: Option<Operation> = env.storage().persistent().get(&(OP_KEY, id));
+        match operation {
+            None => OperationState::Unset,
+            Some(op) => {
+                if op.executed {
+                    OperationState::Done
+                } else if env.ledger().timestamp() < op.ready_at {
+                    OperationState::Waiting
+                } else if env.ledger().timestamp() > op.expires_at {
+                    OperationState::Done
+                } else {
+                    OperationState::Ready
+                }
+            }
+        }
+    }
+
+    pub fn is_operation_done(env: Env, id: BytesN<32>) -> bool {
+        let operation: Option<Operation> = env.storage().persistent().get(&(OP_KEY, id));
+        operation.map(|op| op.executed).unwrap_or(false)
+    }
+
+    // ---------------------------------------------------------------------
+    // Public hash helper
+    // ---------------------------------------------------------------------
+
+    /// Compute the operation id for a batch of calls.
+    pub fn hash_operation(
+        env: Env,
+        calls: Vec<Call>,
+        predecessor: BytesN<32>,
+        salt: BytesN<32>,
+    ) -> BytesN<32> {
+        Self::hash_operation_internal(&env, &calls, &predecessor, &salt)
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal helpers
+    // ---------------------------------------------------------------------
+
+    fn hash_operation_internal(
+        env: &Env,
+        calls: &Vec<Call>,
+        predecessor: &BytesN<32>,
+        salt: &BytesN<32>,
+    ) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+
+        for call in calls.iter() {
+            let target_bytes = call.target.clone().to_xdr(env);
+            preimage.append(&target_bytes);
+
+            let function_bytes = call.function.clone().to_xdr(env);
+            preimage.append(&function_bytes);
+
+            for arg in call.args.iter() {
+                let arg_bytes = arg.to_xdr(env);
+                preimage.append(&arg_bytes);
+            }
+        }
+
+        preimage.append(&Bytes::from_slice(env, &predecessor.to_array()));
+        preimage.append(&Bytes::from_slice(env, &salt.to_array()));
+
+        env.crypto().sha256(&preimage).into()
+    }
+
+    fn zero_hash(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
+    }
+
+    fn grant_role_internal(env: &Env, role: &Symbol, account: &Address) {
+        env.storage()
+            .persistent()
+            .set(&(ROLE_KEY, role.clone(), account.clone()), &true);
+    }
+
+    fn require_role(env: &Env, role: &Symbol) {
+        let caller = env.current_contract_address();
+        let has: bool = env
+            .storage()
+            .persistent()
+            .get(&(ROLE_KEY, role.clone(), caller))
+            .unwrap_or(false);
+        if !has {
+            env.panic_with_error(TimelockError::Unauthorized);
+        }
+    }
+
+    fn require_admin(env: &Env) {
+        Self::require_role(env, &ADMIN);
+    }
+}
