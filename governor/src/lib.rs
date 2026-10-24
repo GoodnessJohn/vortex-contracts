@@ -103,6 +103,7 @@ pub enum GovernorError {
     InvalidProposalThreshold = 18,
     InvalidQuorum = 19,
     Unauthorized = 20,
+    NotAuthorized = 21,
 }
 
 #[contracttype]
@@ -200,7 +201,7 @@ impl Governor {
         }
 
         let snapshot = env.ledger().sequence();
-        let power = Self::voting_power(&env, &config.registry, &proposer, snapshot);
+        let power = Self::compute_voting_power(&env, &config.registry, &proposer, snapshot);
         if power < config.proposal_threshold {
             return Err(GovernorError::BelowProposalThreshold);
         }
@@ -233,6 +234,37 @@ impl Governor {
         Ok(id)
     }
 
+    /// Cancel a proposal. Mirrors `timelock`'s cancel precedent: the proposer
+    /// may cancel before voting starts, and the timelock (acting as the
+    /// guardian/admin) may cancel at any point before execution.
+    pub fn cancel(env: Env, caller: Address, proposal_id: u32) -> Result<(), GovernorError> {
+        caller.require_auth();
+        let config = Self::config(&env)?;
+        let mut proposal = Self::proposal(&env, proposal_id)?;
+
+        if proposal.executed {
+            return Err(GovernorError::AlreadyExecuted);
+        }
+        if proposal.canceled {
+            return Err(GovernorError::ProposalCanceled);
+        }
+
+        let voting_started = env.ledger().sequence() >= proposal.snapshot + config.voting_delay;
+        let is_proposer = caller == proposal.proposer;
+        let is_admin = caller == config.timelock;
+        if !is_admin && !(is_proposer && !voting_started) {
+            return Err(GovernorError::NotAuthorized);
+        }
+
+        proposal.canceled = true;
+        env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "proposal_canceled"), proposal_id),
+            caller,
+        );
+        Ok(())
+    }
+
     /// Cast a vote. Power is read at the proposal snapshot, never at the
     /// current ledger, so stake acquired after the snapshot has no effect.
     pub fn cast_vote(
@@ -243,7 +275,7 @@ impl Governor {
     ) -> Result<i128, GovernorError> {
         voter.require_auth();
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
 
         if proposal.canceled {
             return Err(GovernorError::ProposalCanceled);
@@ -261,7 +293,7 @@ impl Governor {
             return Err(GovernorError::AlreadyVoted);
         }
 
-        let power = Self::voting_power(&env, &config.registry, &voter, proposal.snapshot);
+        let power = Self::compute_voting_power(&env, &config.registry, &voter, proposal.snapshot);
         if power <= 0 {
             return Err(GovernorError::NoVotingPower);
         }
@@ -281,13 +313,26 @@ impl Governor {
     }
 
     /// Queue a succeeded proposal into the timelock.
+    ///
+    /// The proposal's `target`/`function`/`calldata` are submitted to the
+    /// configured `timelock` contract's scheduling entrypoint so the timelock
+    /// owns the delayed execution. The governor records the resulting `eta`.
     pub fn queue(env: Env, proposal_id: u32) -> Result<(), GovernorError> {
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if Self::state_of(&env, &config, &proposal) != ProposalState::Succeeded {
             return Err(GovernorError::ProposalNotSucceeded);
         }
-        proposal.eta = env.ledger().sequence() + config.voting_delay;
+        let eta = env.ledger().sequence() + config.voting_delay;
+        // Schedule the call on the timelock. The timelock's `schedule` entrypoint
+        // takes the target, function, args and the earliest execution ledger.
+        let args: Vec<Val> = Vec::new(&env);
+        env.invoke_contract::<()>(
+            &config.timelock,
+            &Symbol::new(&env, "schedule"),
+            (proposal.target.clone(), proposal.function.clone(), args, eta).into_val(&env),
+        );
+        proposal.eta = eta;
         env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
         env.events()
             .publish((symbol_short!("queue"),), (proposal_id, proposal.eta));
@@ -295,9 +340,13 @@ impl Governor {
     }
 
     /// Execute a queued proposal once the timelock delay has elapsed.
+    ///
+    /// The governor asks the timelock to perform the actual cross-contract call
+    /// before marking the proposal executed, so a "passed and executed"
+    /// proposal has real on-chain effect.
     pub fn execute(env: Env, proposal_id: u32) -> Result<(), GovernorError> {
         let config = Self::config(&env)?;
-        let mut proposal = Self::proposal(&env, proposal_id)?;
+        let mut proposal = Self::load_proposal(&env, proposal_id)?;
         if proposal.executed {
             return Err(GovernorError::AlreadyExecuted);
         }
@@ -307,6 +356,14 @@ impl Governor {
         if env.ledger().sequence() < proposal.eta {
             return Err(GovernorError::TimelockNotReady);
         }
+        // Ask the timelock to execute the scheduled call. The timelock performs
+        // the actual `invoke_contract` on the proposal's target.
+        let args: Vec<Val> = Vec::new(&env);
+        env.invoke_contract::<()>(
+            &config.timelock,
+            &Symbol::new(&env, "execute"),
+            (proposal.target.clone(), proposal.function.clone(), args).into_val(&env),
+        );
         proposal.executed = true;
         env.storage().persistent().set(&Self::proposal_key(&env, proposal_id), &proposal);
         // The timelock performs the actual call; the governor records the
@@ -328,12 +385,12 @@ impl Governor {
 
     pub fn state(env: Env, proposal_id: u32) -> Result<ProposalState, GovernorError> {
         let config = Self::config(&env)?;
-        let proposal = Self::proposal(&env, proposal_id)?;
+        let proposal = Self::load_proposal(&env, proposal_id)?;
         Ok(Self::state_of(&env, &config, &proposal))
     }
 
     pub fn proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
-        Self::proposal(&env, proposal_id)
+        Self::load_proposal(&env, proposal_id)
     }
 
     pub fn voting_power(env: Env, account: Address, ledger: u32) -> Result<i128, GovernorError> {
@@ -367,6 +424,13 @@ impl Governor {
             .instance()
             .get(&Symbol::new(env, "config"))
             .ok_or(GovernorError::NotInitialized)
+    }
+
+    fn load_proposal(env: &Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
+        env.storage()
+            .persistent()
+            .get(&Self::proposal_key(env, proposal_id))
+            .ok_or(GovernorError::ProposalNotFound)
     }
 
     fn proposal(env: &Env, proposal_id: u32) -> Result<Proposal, GovernorError> {
@@ -411,6 +475,11 @@ impl Governor {
             .get(&key)
             .unwrap_or(Vec::new(env));
         Self::search(&checkpoints, ledger)
+    }
+
+    /// Alias kept for callers that use the `compute_voting_power` name.
+    fn compute_voting_power(env: &Env, registry: &Address, account: &Address, ledger: u32) -> i128 {
+        Self::voting_power(env, registry, account, ledger)
     }
 
     /// Binary search for the latest checkpoint at or before `ledger`.
