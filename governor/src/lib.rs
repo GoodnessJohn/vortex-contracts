@@ -3,7 +3,6 @@ use soroban_sdk::{
     IntoVal, Symbol, Val, Vec,
 };
 use vortex_common::require_admin;
-
 //! Stake-weighted Governor for protocol parameter changes.
 //!
 //! Voting power is derived from solver bond plus delegated stake recorded in
