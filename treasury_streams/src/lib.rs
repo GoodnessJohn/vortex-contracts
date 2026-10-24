@@ -10,6 +10,8 @@ use soroban_sdk::{
 pub enum DataKey {
     /// Address allowed to create/cancel streams (timelock or governor).
     Governor,
+    /// Pending governor proposed via the two-step rotation flow.
+    PendingGovernor,
     /// Monotonic counter for stream ids.
     NextId,
     /// Per-stream record.
@@ -52,6 +54,7 @@ pub enum Error {
     NothingToWithdraw = 7,
     AlreadyCancelled = 8,
     ArithmeticOverflow = 9,
+    NoPendingGovernor = 12,
     Paused = 10,
     NotPaused = 11,
 }
@@ -69,6 +72,33 @@ impl TreasuryStreams {
         env.storage().instance().set(&DataKey::Governor, &governor);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Step 1 of two-step governor rotation: current governor proposes a new one.
+    pub fn propose_governor_transfer(env: Env, new_governor: Address) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governor)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernor, &new_governor);
+        Ok(())
+    }
+
+    /// Step 2 of two-step governor rotation: the proposed governor accepts.
+    pub fn accept_governor_transfer(env: Env) -> Result<(), Error> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingGovernor)
+            .ok_or(Error::NoPendingGovernor)?;
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Governor, &pending);
+        env.storage().instance().remove(&DataKey::PendingGovernor);
         Ok(())
     }
 
@@ -369,3 +399,6 @@ impl TreasuryStreams {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod bench;
