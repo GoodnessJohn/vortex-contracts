@@ -26,9 +26,6 @@ build-wasms:
 	cargo build --release --target wasm32-unknown-unknown \
 		-p registry -p intent_settlement -p proofs -p badges
 
-integration-test: build-wasms
-	cargo test -p integration-tests
-
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 WORKSPACE       := intent_settlement
@@ -73,6 +70,20 @@ build:  ## Build the release wasm binary
 .PHONY: audit
 audit:  ## Run cargo-audit against the dependency tree
 	cd $(WORKSPACE) && cargo audit
+
+# ── Generated documentation (issue #531) ─────────────────────────────────────
+#
+# README.md's "Error Reference" table is generated from the `Error` enum in
+# intent_settlement/src/lib.rs.  `error-reference-check` fails when the two
+# have drifted apart; `error-reference` rewrites the table.
+
+.PHONY: error-reference
+error-reference:  ## Regenerate README.md's Error Reference table from the Error enum
+	python3 scripts/generate-error-reference.py --write
+
+.PHONY: error-reference-check
+error-reference-check:  ## Verify README.md's Error Reference table matches the Error enum
+	python3 scripts/generate-error-reference.py --check
 
 .PHONY: clean
 clean:  ## Remove build artefacts
@@ -141,6 +152,12 @@ local-network-logs:  ## Tail local network logs
 .PHONY: local-network-status
 local-network-status:  ## Check local network status
 	./setup-local-network.sh status
+
+# ── Integration tests ────────────────────────────────────────────────────────
+
+.PHONY: integration-test
+integration-test: build-wasms  ## Run the integration test suite against freshly built wasms
+	cargo test -p integration-tests
 
 # ── Kani model checking (issue #415) ─────────────────────────────────────────
 
