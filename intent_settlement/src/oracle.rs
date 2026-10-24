@@ -17,8 +17,6 @@
 //!   (the check still runs, so an over-exposed solver is still blocked)
 //! - `slash_solver` → proceeds regardless (slashing must never be blocked)
 
-#![allow(unused)]
-
 use soroban_sdk::{contractclient, Address, Env};
 
 // ─── SEP-40 compatible oracle client ─────────────────────────────────────────
@@ -52,6 +50,41 @@ pub const MAX_PRICE_AGE_SECS: u64 = 300;
 /// Maximum allowed deviation between two oracle sources, in basis points (2%).
 pub const MAX_PRICE_DEVIATION_BPS: i128 = 200;
 
+/// Value of `from` expressed in units of `to`, in basis points (10_000 = 1.0×),
+/// derived from oracle prices. Fail-closed: returns the conservative 1.0×
+/// weight when `from == to`, no oracle is configured, or either price is
+/// stale / zero / missing / would overflow. Never traps.
+pub fn weight_bps(env: &Env, oracle_addr: Option<&Address>, from: &Address, to: &Address) -> i128 {
+    const NEUTRAL: i128 = 10_000;
+    let Some(oracle_addr) = oracle_addr else {
+        return NEUTRAL;
+    };
+    if from == to {
+        return NEUTRAL;
+    }
+    let (Ok((pf, df)), Ok((pt, dt))) = (
+        fetch_price(env, oracle_addr, from),
+        fetch_price(env, oracle_addr, to),
+    ) else {
+        return NEUTRAL;
+    };
+    // (pf / 10^df) / (pt / 10^dt) * 10_000
+    let w = 10i128
+        .checked_pow(dt)
+        .and_then(|a| pf.checked_mul(a))
+        .and_then(|n| n.checked_mul(NEUTRAL))
+        .and_then(|n| {
+            10i128
+                .checked_pow(df)
+                .and_then(|b| pt.checked_mul(b))
+                .and_then(|d| n.checked_div(d))
+        });
+    match w {
+        Some(w) if w > 0 => w,
+        _ => NEUTRAL,
+    }
+}
+
 // ─── Result type ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
@@ -76,7 +109,9 @@ pub fn fetch_price(
     asset: &Address,
 ) -> Result<(i128, u32), OracleFault> {
     let client = OracleAdapterClient::new(env, oracle_addr);
-    match client.lastprice(asset.clone()) {
+    // `try_` so a trapping / non-conforming oracle is a fault, not a revert:
+    // slashing must never be blocked by the oracle.
+    match client.try_lastprice(asset).ok().and_then(|r| r.ok()).flatten() {
         None => Err(OracleFault::NotAvailable),
         Some(pd) => {
             let now = env.ledger().timestamp();
@@ -94,6 +129,7 @@ pub fn fetch_price(
 /// Check that two prices (from different sources) agree within
 /// `MAX_PRICE_DEVIATION_BPS`. Returns `true` if they agree, `false`
 /// if the deviation exceeds the threshold or either price is zero.
+#[allow(dead_code)] // reserved for dual-source oracle setups
 pub fn prices_agree(price_a: i128, dec_a: u32, price_b: i128, dec_b: u32) -> bool {
     if price_a <= 0 || price_b <= 0 {
         return false;

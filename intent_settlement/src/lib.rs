@@ -19,6 +19,9 @@ use vortex_proof_registry::ProofRegistryClient;
 mod test;
 
 #[cfg(test)]
+mod test_oracle;
+
+#[cfg(test)]
 mod proptest_bond;
 
 #[cfg(test)]
@@ -3146,8 +3149,17 @@ impl IntentSettlement {
             .instance()
             .set(&DataKey::UserNonce(user.clone()), &(nonce + 1));
 
-        // Deterministic intent_id = hash(user, src_chain, src_token, src_amount, now, nonce)
-        let intent_id = Self::compute_intent_id(&env, &user, &src_chain, src_amount, now, nonce);
+        // Issue #354/#565: timestamp-free, client-computable intent id
+        // (docs/CLIENT_COMPUTABLE_INTENT_IDS.md).
+        let intent_id = Self::compute_intent_id(
+            &env,
+            &user,
+            &src_chain,
+            src_amount,
+            &dst_token,
+            min_dst_amount,
+            nonce,
+        );
 
         // Guard against an extremely unlikely hash collision: if a record with
         // this id somehow already exists, or a tombstone exists (pruned intent),
@@ -3358,15 +3370,10 @@ impl IntentSettlement {
         solver_record.active_intents += 1;
 
         // ── Exposure tracking (#367) ─────────────────────────────────────────
-        // Use a flat 1.0× weight (10_000 bps) until the oracle (#368) supplies
-        // real prices. Same-token intents are always measured; cross-token
-        // intents use the same conservative default until the oracle is live.
-        let weight: i128 = 10_000; // 1.0× in bps
-        let notional = intent.min_dst_amount
-            .checked_mul(weight)
-            .unwrap_or(intent.min_dst_amount)
-            .checked_div(BPS_DENOMINATOR)
-            .unwrap_or(intent.min_dst_amount);
+        // Cross-token intents are weighted by the oracle (#368); stale / missing
+        // prices or an unset oracle fall back to a conservative 1.0× weight.
+        let notional =
+            Self::exposure_notional(&env, &intent.dst_token, &bond_token, intent.min_dst_amount);
         let current_exposure: i128 = env
             .storage()
             .persistent()
@@ -3577,11 +3584,16 @@ impl IntentSettlement {
                 .get(&DataKey::SolverExposure(solver.clone()))
                 .unwrap_or(0);
             // Release: full notional on complete fill; proportional on partial.
-            let released = if cumulative >= intent.min_dst_amount {
-                intent.min_dst_amount
-            } else {
-                fill_amount
-            };
+            let released = Self::exposure_notional(
+                &env,
+                &intent.dst_token,
+                &intent.bond_token,
+                if cumulative >= intent.min_dst_amount {
+                    intent.min_dst_amount
+                } else {
+                    fill_amount
+                },
+            );
             env.storage()
                 .persistent()
                 .set(
@@ -3917,7 +3929,13 @@ impl IntentSettlement {
             .persistent()
             .get(&DataKey::SolverExposure(solver_addr.clone()))
             .unwrap_or(0);
-        let unfilled_notional = intent.min_dst_amount.saturating_sub(intent.total_filled);
+        // Oracle faults fall back to 1.0×; slashing is never blocked by them.
+        let unfilled_notional = Self::exposure_notional(
+            &env,
+            &intent.dst_token,
+            &bond_token,
+            intent.min_dst_amount.saturating_sub(intent.total_filled),
+        );
         env.storage()
             .persistent()
             .set(
@@ -4266,6 +4284,33 @@ impl IntentSettlement {
         env.storage().instance().set(&DataKey::Arbiter, &arbiter);
         env.events()
             .publish((Symbol::new(&env, "arbiter_updated"),), arbiter);
+    }
+
+    /// Admin-only (issue #555): install the `arbiter_panel` contract as the
+    /// sole address accepted by `resolve_dispute`. Until this is called the
+    /// legacy single-arbiter model (`set_arbiter` / `Admin`) is in effect.
+    pub fn set_arbiter_panel(env: Env, panel: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::Arbiter, &panel);
+        env.events()
+            .publish((Symbol::new(&env, "arbiter_panel_set"),), panel);
+    }
+
+    /// `(user, solver)` of an intent in the `Disputed` state. Used by the
+    /// arbiter panel to exclude conflicted arbiters from panel selection.
+    pub fn dispute_parties(env: Env, intent_id: BytesN<32>) -> (Address, Address) {
+        let intent: IntentRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotFound));
+        if intent.state != IntentState::Disputed {
+            panic_with_error!(&env, Error::IntentNotDisputed);
+        }
+        let solver = intent
+            .solver
+            .unwrap_or_else(|| panic_with_error!(&env, Error::IntentNotDisputed));
+        (intent.user, solver)
     }
 
     /// The current arbiter (explicit `set_arbiter` value, else the `Admin`).
@@ -6581,6 +6626,1045 @@ impl IntentSettlement {
                 .persistent()
                 .set(&DataKey::SolverListCount, &last_flat);
         }
+    }
+
+    /// Issue #368/#549: `amount` of `dst_token` valued in `bond_token` units
+    /// for exposure accounting. Uses the configured oracle's cross-rate for
+    /// cross-token intents; on a missing / stale / invalid price (or no oracle)
+    /// it applies the conservative 1.0× weight, so the check still runs.
+    fn exposure_notional(env: &Env, dst_token: &Address, bond_token: &Address, amount: i128) -> i128 {
+        let oracle_addr = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::OracleAddr);
+        let weight = oracle::weight_bps(env, oracle_addr.as_ref(), dst_token, bond_token);
+        amount
+            .checked_mul(weight)
+            .unwrap_or(amount)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(amount)
+    }
+
+    fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {
+        let base_bond = Self::load_config(env).min_bond;
+        let multiplier = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::MinBondMultiplier(dst_token.clone()))
+            .unwrap_or(10);
+        (base_bond * multiplier) / 10
+    }
+
+    /// #197: resolve `solver`'s registry tier for perk calculation.
+    ///
+    /// Makes a single cross-contract call — `solver_registry.get_tier(solver)`
+    /// — via `try_invoke_contract` (rather than a generated `#[contractclient]`,
+    /// to keep the settlement wasm small). Returns `0` (Unranked) — the
+    /// pre-integration behaviour — whenever the registry address is unset, or
+    /// the call reverts, or the return value doesn't decode as a `u32`. The
+    /// result is clamped to a known tier so the perk tables index safely.
+    fn solver_tier(env: &Env, solver: &Address) -> u32 {
+        let Some(registry) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::SolverRegistry)
+        else {
+            return 0;
+        };
+        let args: Vec<soroban_sdk::Val> = (solver.clone(),).into_val(env);
+        let result: Result<Result<u32, _>, Result<soroban_sdk::Error, _>> =
+            env.try_invoke_contract(&registry, &Symbol::new(env, "get_tier"), args);
+        match result {
+            Ok(Ok(tier)) => tier.min(TIER_SLASH_BPS.len() as u32 - 1),
+            _ => 0,
+        }
+    }
+
+    /// Fill-window seconds a solver on `tier` gets when accepting: the base
+    /// `fill_window` plus the tier's `TIER_FILL_WINDOW_BONUS_BPS` extension.
+    fn tier_fill_window(tier: u32, base_fill_window: u64) -> u64 {
+        let bonus_bps = TIER_FILL_WINDOW_BONUS_BPS
+            .get(tier as usize)
+            .copied()
+            .unwrap_or(0);
+        base_fill_window.saturating_mul(10_000 + bonus_bps) / 10_000
+    }
+
+    /// Load the protocol config from storage, falling back to defaults for
+    /// contracts that pre-date this upgrade (upgrade-safe).
+    fn load_config(env: &Env) -> ProtocolConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or(ProtocolConfig {
+                min_bond: DEFAULT_MIN_BOND,
+                fill_window: DEFAULT_FILL_WINDOW,
+                intent_expiry: DEFAULT_INTENT_EXPIRY,
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                max_active_intents_per_solver: DEFAULT_MAX_ACTIVE_INTENTS_PER_SOLVER,
+                max_slash_cycles: 3,
+                referral_share_bps: 0,
+                backstop_vault_share_bps: 0,
+                coverage_multiplier: 10,
+            })
+    }
+
+    fn load_bond_token(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
+    }
+
+    /// Returns `true` when bid-window mode is active.
+    ///
+    /// Issue #191: this now reads a dedicated `DataKey::BidWindowEnabled` flag
+    /// set via `set_bid_window_enabled`.  It previously reused
+    /// `DataKey::DstAllowlistEnabled` "as a placeholder", which meant toggling
+    /// the destination-token allowlist would silently also toggle bidding mode —
+    /// a storage-key collision that is now closed.  Defaults to `false` so
+    /// first-accept-wins behaviour is preserved on every deployment that
+    /// pre-dates this feature.
+    ///
+    /// Bid-window mode changes `submit_intent` so newly created intents start
+    /// in the `Bidding` state instead of `Open`, giving solvers a fixed
+    /// `BID_WINDOW`-second window to submit competing quotes via `bid_intent`
+    /// before `settle_bids` assigns the winner.
+    pub fn is_bid_window_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::BidWindowEnabled)
+            .unwrap_or(false)
+    }
+
+    /// Issue #187 — the minimum bond required for a given bond token.
+    ///
+    /// * Legacy default token → the effective `min_bond` from `ProtocolConfig`
+    ///   (so pre-#187 behaviour and any admin `set_config` override are
+    ///   preserved).
+    /// * Any other approved token → an admin-set `DataKey::MinBond(token)`
+    ///   entry, falling back to the compile-time `MIN_BOND` constant when the
+    ///   admin has not set one.
+    fn min_bond_for_token(env: &Env, token: &Address) -> i128 {
+        if *token == Self::load_bond_token(env) {
+            return Self::load_config(env).min_bond;
+        }
+        env.storage()
+            .instance()
+            .get(&DataKey::MinBond(token.clone()))
+            .unwrap_or(MIN_BOND)
+    }
+
+    /// Issue #187 — `true` if `token` may be used as a solver bond: either it
+    /// is the legacy default token (always allowed) or it has an explicit
+    /// `DataKey::AllowedBondToken` entry.
+    fn is_bond_token_allowed(env: &Env, token: &Address) -> bool {
+        *token == Self::load_bond_token(env)
+            || env
+                .storage()
+                .instance()
+                .has(&DataKey::AllowedBondToken(token.clone()))
+    }
+
+    /// Issue #187 — read a solver's bond in a specific token.
+    ///
+    /// For the legacy default token the source of truth is
+    /// `SolverRecord.bond_amount` (kept mirrored for pre-#187 readers); for
+    /// every other token it is the `DataKey::SolverBond(solver, token)` entry.
+    fn get_solver_bond_amount(env: &Env, record: &SolverRecord, token: &Address) -> i128 {
+        if *token == Self::load_bond_token(env) {
+            record.bond_amount
+        } else {
+            env.storage()
+                .persistent()
+                .get(&DataKey::SolverBond(record.address.clone(), token.clone()))
+                .unwrap_or(0)
+        }
+    }
+
+    /// Issue #187 — write a solver's bond in a specific token, keeping the
+    /// legacy `bond_amount` mirror and the `bond_tokens` enumeration in sync.
+    /// A zero balance drops the token from `bond_tokens` (and, for non-default
+    /// tokens, removes the storage entry entirely).
+    fn set_solver_bond_amount(
+        env: &Env,
+        record: &mut SolverRecord,
+        token: &Address,
+        amount: i128,
+    ) {
+        let default_token = Self::load_bond_token(env);
+        if *token == default_token {
+            record.bond_amount = amount;
+        } else if amount > 0 {
+            env.storage().persistent().set(
+                &DataKey::SolverBond(record.address.clone(), token.clone()),
+                &amount,
+            );
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SolverBond(record.address.clone(), token.clone()));
+        }
+
+        let mut present = false;
+        for i in 0..record.bond_tokens.len() {
+            if record.bond_tokens.get(i).unwrap() == *token {
+                present = true;
+                break;
+            }
+        }
+        if amount > 0 && !present {
+            record.bond_tokens.push_back(token.clone());
+        } else if amount == 0 && present {
+            // Rebuild without `token`, mirroring `remove_from_dst_token_list`.
+            let mut rebuilt: Vec<Address> = Vec::new(env);
+            for i in 0..record.bond_tokens.len() {
+                let t = record.bond_tokens.get(i).unwrap();
+                if t != *token {
+                    rebuilt.push_back(t);
+                }
+            }
+            record.bond_tokens = rebuilt;
+        }
+    }
+
+    /// Issue #193 — proportional bond slash.
+    ///
+    /// Returns the amount to slash from `bond` for a solver that failed to
+    /// deliver an intent whose outstanding output is `unfilled_amount`
+    /// (`min_dst_amount - total_filled`, floored at 0):
+    ///
+    /// ```text
+    ///   exposure   = min(unfilled_amount, bond)   // same-token comparability
+    ///   proportional = exposure / 10              // 10% of what was at stake
+    ///   cap          = bond * SLASH_BPS / 10_000  // never worse than flat 10%
+    ///   slash        = clamp(proportional, 1, min(cap, bond))
+    /// ```
+    ///
+    /// Properties (mirroring `compute_reputation_score`'s edge-case discipline):
+    /// * Integer-only, cannot panic (all operands ≥ 0, no division by zero).
+    /// * Floor of 1 stroop preserves issue #32's "non-zero bond is always
+    ///   punished" guarantee.
+    /// * Cap at `bond * 10%` means a well-matched bond is never slashed harder
+    ///   than the old flat rate; a solver who over-bonds relative to the intent
+    ///   is slashed *less*, and a solver who under-bonds is still capped at
+    ///   100% of bond (via `exposure ≤ bond`) and never panics.
+    /// * `unfilled_amount == 0` (shouldn't happen for an Accepted intent, but
+    ///   guarded) still yields the floor of 1.
+    fn compute_slash_amount(bond: i128, unfilled_amount: i128) -> i128 {
+        if bond <= 0 {
+            return 0;
+        }
+        let exposure = unfilled_amount.max(0).min(bond);
+        let proportional = exposure / 10;
+        let cap = (bond / 10_000) * SLASH_BPS;
+        let cap = cap.min(bond).max(1);
+        proportional.max(1).min(cap)
+    }
+
+    /// Issue #409 — balance-delta pull helper.
+    ///
+    /// Transfers `amount` of `token` from `from` into the contract and returns the
+    /// **actual** amount received, measured as `balance_after - balance_before`.
+    ///
+    /// Fee-on-transfer tokens silently reduce the amount that lands in the
+    /// contract; rebasing tokens can change balances between calls. By recording
+    /// the delta rather than the requested `amount`, every inbound accounting
+    /// entry reflects reality.
+    ///
+    /// **Decision per path:**
+    /// * Bond registration / top-up (`register_solver_inner`): fee-on-transfer bonds
+    ///   would mean the solver is recorded as holding more bond than the contract
+    ///   actually has — accept the delta and record only what arrived.
+    ///   Rebasing-up bonds would credit the solver extra without a transfer; they
+    ///   are not supported as bond tokens (admin must not allowlist them).
+    /// * `begin_fill` escrow: same reasoning — record only the escrowed amount that
+    ///   actually landed, which is what the user will receive on `release_fill`.
+    /// * Dispute bond: same — record only what arrived as the dispute collateral.
+    ///
+    /// **Fills paid solver→user directly** (`fill_intent`) are exempt: the
+    /// contract is not the receiver, so there is no balance to measure. The user
+    /// receives whatever the token delivers; that is outside this contract's
+    /// accounting responsibility.
+    ///
+    /// **CEI note:** callers must write all state changes that depend on the
+    /// returned `received` value *after* this call returns, not before. The helper
+    /// itself is read-balance → transfer → read-balance, which is the minimal
+    /// reentrancy surface; the two balance reads bracket a single external call.
+    fn pull_exact(
+        env: &Env,
+        token: &Address,
+        from: &Address,
+        amount: i128,
+    ) -> i128 {
+        let client = token::Client::new(env, token);
+        let contract = env.current_contract_address();
+        let before: i128 = client.balance(&contract);
+        client.transfer(from, &contract, &amount);
+        let after: i128 = client.balance(&contract);
+        after - before
+    }
+
+    /// Issue #188 — the address allowed to call `resolve_dispute`: the
+    /// `DataKey::Arbiter` entry if set, otherwise the `Admin` (the design
+    /// doc's v1 default).
+    fn load_arbiter(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Arbiter)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::Admin)
+                    .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized))
+            })
+    }
+
+    /// Returns the effective protocol fee in basis points from the stored
+    /// `ProtocolConfig`.
+    ///
+    /// Future work (tiered-fee feature): this can be extended to take a solver
+    /// address and apply volume-tier discounts from the solver's historical
+    /// `total_volume`. It is retained as the single intended lookup point for
+    /// that logic; `#[allow(dead_code)]` because `fill_intent` still reads the
+    /// flat `PROTOCOL_FEE_BPS` constant directly today.
+    #[allow(dead_code)]
+    fn get_tiered_fee_bps(env: &Env) -> i128 {
+        Self::load_config(env).protocol_fee_bps
+    }
+
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
+    fn bump_intent_ttl(env: &Env, intent_id: &BytesN<32>) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Intent(intent_id.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Load an intent record, or panic `IntentNotFound`.
+    fn load_intent(env: &Env, intent_id: &BytesN<32>) -> IntentRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Intent(intent_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(env, Error::IntentNotFound))
+    }
+
+    /// Persist an intent record and bump its TTL.
+    fn save_intent(env: &Env, intent_id: &BytesN<32>, intent: &IntentRecord) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Intent(intent_id.clone()), intent);
+        Self::bump_intent_ttl(env, intent_id);
+    }
+
+    fn bump_solver_ttl(env: &Env, solver: &Address) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Solver(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Seconds remaining until a `SLASH_COOLDOWN` starting at `last_slash_time`
+    /// clears, given the current ledger time `now`. Returns `0` for a solver
+    /// that has never been slashed (`last_slash_time == 0`) or whose cooldown
+    /// has already elapsed. Shared by `accept_intent` and
+    /// `get_slash_cooldown_remaining` so both can never disagree (issue #256).
+    fn slash_cooldown_remaining(last_slash_time: u64, now: u64) -> u64 {
+        if last_slash_time == 0 {
+            return 0;
+        }
+        let cooldown_end = last_slash_time + SLASH_COOLDOWN;
+        cooldown_end.saturating_sub(now)
+    }
+
+    /// Appends `intent_id` to `solver`'s `SolverIntents` list (issue #245, #374).
+    /// O(1): pushes to the back and records a `SolverIntentIdx` entry for swap-remove.
+    /// Duplicate adds are guarded: if the index already exists, the add is a no-op.
+    fn solver_intents_add(env: &Env, solver: &Address, intent_id: &BytesN<32>) {
+        let idx_key = DataKey::SolverIntentIdx(solver.clone(), intent_id.clone());
+        if env.storage().persistent().has(&idx_key) {
+            return; // already present (e.g. re-accepted after a slash reset)
+        }
+
+        let list_key = DataKey::SolverIntents(solver.clone());
+        let mut list: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let pos = list.len();
+        list.push_back(intent_id.clone());
+
+        env.storage().persistent().set(&list_key, &list);
+        env.storage().persistent().extend_ttl(
+            &list_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.storage().persistent().set(&idx_key, &pos);
+        env.storage().persistent().extend_ttl(
+            &idx_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Removes `intent_id` from `solver`'s `SolverIntents` list (issue #245, #374).
+    /// O(1) via swap-remove: swaps the target with the last element, pops the tail,
+    /// and updates the displaced element's index entry. A no-op if the index is absent.
+    fn solver_intents_remove(env: &Env, solver: &Address, intent_id: &BytesN<32>) {
+        let idx_key = DataKey::SolverIntentIdx(solver.clone(), intent_id.clone());
+        let pos: u32 = match env.storage().persistent().get(&idx_key) {
+            Some(p) => p,
+            None => return, // not present
+        };
+
+        let list_key = DataKey::SolverIntents(solver.clone());
+        let mut list: Vec<BytesN<32>> = match env.storage().persistent().get(&list_key) {
+            Some(l) => l,
+            None => return,
+        };
+
+        let last = list.len().saturating_sub(1);
+        if pos != last {
+            // Swap target with last element.
+            let tail_id = list.get(last).unwrap();
+            list.set(pos, tail_id.clone());
+            // Update the tail element's index to its new position.
+            let tail_idx_key = DataKey::SolverIntentIdx(solver.clone(), tail_id);
+            env.storage().persistent().set(&tail_idx_key, &pos);
+            env.storage().persistent().extend_ttl(
+                &tail_idx_key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+        }
+        list.remove(last);
+
+        env.storage().persistent().set(&list_key, &list);
+        env.storage().persistent().extend_ttl(
+            &list_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.storage().persistent().remove(&idx_key);
+    }
+
+    // ── Issue #153: Bucketed UserIntents helpers ──────────────────────────────
+
+    /// Append `intent_id` to `user`'s bucketed intent list (issue #153).
+    ///
+    /// Reads `UserIntentCount(user)` to determine the current bucket index and
+    /// slot, writes `Some(intent_id)` into that slot, increments the count,
+    /// and bumps the bucket's TTL.
+    fn user_intents_append(env: &Env, user: &Address, intent_id: &BytesN<32>) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserIntentCount(user.clone()))
+            .unwrap_or(0);
+
+        let bucket = count / USER_INTENT_BUCKET_SIZE;
+        let bucket_key = DataKey::UserIntents(user.clone(), bucket);
+
+        let mut page: Vec<Option<BytesN<32>>> = env
+            .storage()
+            .persistent()
+            .get(&bucket_key)
+            .unwrap_or_else(|| Vec::new(env));
+        page.push_back(Some(intent_id.clone()));
+        env.storage().persistent().set(&bucket_key, &page);
+        env.storage().persistent().extend_ttl(
+            &bucket_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserIntentCount(user.clone()), &(count + 1));
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserIntentCount(user.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    /// Prune `intent_id` from `user`'s bucket by setting its slot to `None`
+    /// (issue #371). The count is NOT decremented — existing flat indices remain
+    /// valid and pagination skips `None` slots.
+    fn user_intents_prune(env: &Env, user: &Address, intent_id: &BytesN<32>, flat_idx: u32) {
+        let bucket = flat_idx / USER_INTENT_BUCKET_SIZE;
+        let slot = flat_idx % USER_INTENT_BUCKET_SIZE;
+        let bucket_key = DataKey::UserIntents(user.clone(), bucket);
+        if let Some(mut page) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Option<BytesN<32>>>>(&bucket_key)
+        {
+            if page.get(slot).unwrap_or(None).as_ref() == Some(intent_id) {
+                page.set(slot, None);
+                env.storage().persistent().set(&bucket_key, &page);
+                env.storage().persistent().extend_ttl(
+                    &bucket_key,
+                    PERSISTENT_TTL_THRESHOLD,
+                    PERSISTENT_TTL_EXTEND_TO,
+                );
+            }
+        }
+    }
+
+    /// Bump the TTL on the currently-active bucket for `user`.  Called from
+    /// `user_intents_append` implicitly; exposed separately for external bumps.
+    fn bump_user_intents_ttl(env: &Env, user: &Address) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserIntentCount(user.clone()))
+            .unwrap_or(0);
+        let bucket = count.saturating_sub(1) / USER_INTENT_BUCKET_SIZE;
+        let bucket_key = DataKey::UserIntents(user.clone(), bucket);
+        if env.storage().persistent().has(&bucket_key) {
+            env.storage().persistent().extend_ttl(
+                &bucket_key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+        }
+    }
+
+    /// Issue #354/#565: client-computable, timestamp-free intent id.
+    ///
+    /// ```text
+    /// params_hash = sha256(xdr(src_chain) || be16(src_amount)
+    ///                      || xdr(dst_token) || be16(min_dst_amount))
+    /// intent_id   = sha256("vortex-intent-v1" || xdr(contract_id) || network_id
+    ///                      || xdr(user) || be8(nonce) || params_hash)
+    /// ```
+    ///
+    /// `network_id` is `sha256(network_passphrase)`. Every input is known to
+    /// the client before submission (the nonce is `get_user_nonce(user)`), so
+    /// the id can be embedded in a source-chain transaction first. Uniqueness
+    /// no longer comes from the ledger timestamp but from the strictly
+    /// increasing per-user nonce, which is part of the preimage and bumped on
+    /// every submission; the contract id and network id prevent cross-contract
+    /// and cross-network replay.
+    fn compute_intent_id(
+        env: &Env,
+        user: &Address,
+        src_chain: &String,
+        src_amount: i128,
+        dst_token: &Address,
+        min_dst_amount: i128,
+        nonce: u64,
+    ) -> BytesN<32> {
+        let mut params = Bytes::new(env);
+        params.append(&src_chain.clone().to_xdr(env));
+        params.extend_from_array(&src_amount.to_be_bytes());
+        params.append(&dst_token.clone().to_xdr(env));
+        params.extend_from_array(&min_dst_amount.to_be_bytes());
+        let params_hash: BytesN<32> = env.crypto().sha256(&params).into();
+
+        let mut preimage = Bytes::from_slice(env, b"vortex-intent-v1");
+        preimage.append(&env.current_contract_address().to_xdr(env));
+        preimage.append(&env.ledger().network_id().into());
+        preimage.append(&user.clone().to_xdr(env));
+        preimage.extend_from_array(&nonce.to_be_bytes());
+        preimage.append(&params_hash.into());
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// The nonce the next `submit_intent` from `user` will use.
+    pub fn get_user_nonce(env: Env, user: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserNonce(user))
+            .unwrap_or(0)
+    }
+
+    /// The id `submit_intent` will assign to a submission with these
+    /// arguments if it executes at `user`'s current nonce. Pure read; lets
+    /// clients cross-check their off-chain computation.
+    pub fn preview_intent_id(
+        env: Env,
+        user: Address,
+        src_chain: String,
+        src_amount: i128,
+        dst_token: Address,
+        min_dst_amount: i128,
+    ) -> BytesN<32> {
+        let nonce = Self::get_user_nonce(env.clone(), user.clone());
+        Self::compute_intent_id(&env, &user, &src_chain, src_amount, &dst_token, min_dst_amount, nonce)
+    }
+
+    fn validate_proof(env: &Env, intent: &IntentRecord, intent_id: &BytesN<32>) {
+        let registry_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProofRegistry)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ProofRegistryNotSet));
+
+        // One extra cross-contract read per gated fill (docs/124 §4.3). This is
+        // the resource-fee cost the issue calls out; it is only paid when the
+        // caller opts in via `require_proof = true`.
+        let registry = ProofRegistryClient::new(env, &registry_addr);
+        let proof = registry
+            .get_proof(intent_id)
+            .unwrap_or_else(|| panic_with_error!(env, Error::ProofNotFound));
+
+        let want_chain_id = Self::wormhole_chain_id(env, &intent.src_chain);
+        if proof.src_chain_id != want_chain_id {
+            panic_with_error!(env, Error::ProofChainMismatch);
+        }
+
+        if proof.src_amount < intent.src_amount {
+            panic_with_error!(env, Error::ProofAmountInsufficient);
+        }
+    }
+
+    /// Map a canonical `src_chain` name to its Wormhole chain ID
+    /// (docs/129 §4, kept in sync with docs/132-supported-chains.md). Panics
+    /// with `SrcChainNotSupported` for any name not in the table.
+    fn wormhole_chain_id(env: &Env, src_chain: &String) -> u32 {
+        let len = src_chain.len() as usize;
+        // Longest supported name ("avalanche") is 9 bytes.
+        if len == 0 || len > 16 {
+            panic_with_error!(env, Error::SrcChainNotSupported);
+        }
+        let mut buf = [0u8; 16];
+        src_chain.copy_into_slice(&mut buf[..len]);
+        match &buf[..len] {
+            b"solana" => 1,
+            b"ethereum" => 2,
+            b"bsc" => 4,
+            b"polygon" => 5,
+            b"avalanche" => 6,
+            b"arbitrum" => 23,
+            b"optimism" => 24,
+            b"base" => 30,
+            _ => panic_with_error!(env, Error::SrcChainNotSupported),
+        }
+    }
+
+    /// Translates a canonical `src_chain` string (per
+    /// `docs/132-supported-chains.md` §2) to its numeric Wormhole chain ID,
+    /// for comparison against `proof.src_chain_id` once proof-gated fills
+    /// (issue #5) are wired up. Single source of truth for this mapping —
+    /// kept in sync with `docs/129-proof-mismatch-fallback.md` §4 (issue #253).
+    ///
+    /// Fails closed: an unmapped/future `src_chain` string panics with
+    /// `Error::SrcChainNotSupported` rather than defaulting to chain ID 0.
+    pub fn src_chain_to_wormhole_id(env: Env, src_chain: String) -> u32 {
+        let chain_len = src_chain.len();
+        let chain_is = |literal: &[u8]| -> bool {
+            if chain_len as usize != literal.len() {
+                return false;
+            }
+            let mut i = 0u32;
+            while i < chain_len {
+                if src_chain.get(i) != literal[i as usize] as u32 {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        };
+
+        if chain_is(b"ethereum") {
+            2
+        } else if chain_is(b"base") {
+            30
+        } else if chain_is(b"polygon") {
+            5
+        } else if chain_is(b"arbitrum") {
+            23
+        } else if chain_is(b"optimism") {
+            24
+        } else if chain_is(b"avalanche") {
+            6
+        } else if chain_is(b"bsc") {
+            4
+        } else if chain_is(b"solana") {
+            1
+        } else {
+            panic_with_error!(&env, Error::SrcChainNotSupported)
+        }
+    }
+
+    fn require_admin(env: &Env) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        // Auth audit: require_auth() is correct. All callers of require_admin
+        // are admin-only functions (unpause, set_pauser,
+        // add/remove_allowed_dst_token, set_dst_allowlist_enabled). The admin
+        // is a single address with uniform authority over these functions;
+        // require_auth_for_args would add no meaningful scope reduction.
+        admin.require_auth();
+    }
+
+    /// Issue #120: `pause` accepts either the admin or the address set via
+    /// `set_pauser`. `caller` is an explicit argument (rather than looked up
+    /// implicitly, as `require_admin` does for the single-admin case)
+    /// because there are now two addresses that could legitimately be the
+    /// signer, so the contract needs to know which one is authorizing this
+    /// call before it can require that specific address's auth.
+    fn require_admin_or_pauser(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let is_pauser = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Pauser)
+            .map(|pauser| pauser == *caller)
+            .unwrap_or(false);
+        if *caller != admin && !is_pauser {
+            panic_with_error!(env, Error::Unauthorized);
+        }
+        caller.require_auth();
+    }
+
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic_with_error!(env, Error::ContractPaused);
+        }
+    }
+
+    /// Issue #420 — named boundary: fill window is still open.
+    /// Exclusive upper bound: `now < deadline` is the last moment fills are valid.
+    /// This is the "EXCLUSIVE fill deadline" convention from issue #26.
+    #[inline]
+    fn fill_window_open(now: u64, deadline: u64) -> bool {
+        now < deadline
+    }
+
+    /// Issue #420 — named boundary: slash is eligible.
+    /// A slash may only be executed once `now >= deadline + SLASH_GRACE_SECS`,
+    /// giving the solver a `SLASH_GRACE_SECS`-second buffer to absorb ledger
+    /// close-time drift (see `docs/420-ledger-time-skew-analysis.md`).
+    /// The fill window uses a DIFFERENT boundary (`fill_window_open`) so fills
+    /// remain valid right up to `deadline` while slashing requires `deadline + grace`.
+    #[inline]
+    fn slash_eligible(now: u64, deadline: u64) -> bool {
+        now >= deadline.saturating_add(SLASH_GRACE_SECS)
+    }
+
+    /// Issue #420 — named boundary: dispute window is still open.
+    /// Exclusive: `now < dispute_deadline`.
+    #[inline]
+    fn dispute_window_open(now: u64, dispute_deadline: u64) -> bool {
+        now < dispute_deadline
+    }
+
+    /// Issue #420 — named boundary: arbiter window has elapsed (timeout).
+    /// Inclusive: timeout is reachable at `now == raised_at + ARBITER_WINDOW`.
+    #[inline]
+    fn arbiter_timeout_reached(now: u64, raised_at: u64) -> bool {
+        now >= raised_at.saturating_add(ARBITER_WINDOW)
+    }
+
+    /// The pre-transfer guard sequence shared between `fill_intent` and
+    /// `is_intent_fillable` (issue #259): intent state is `Accepted`, `solver`
+    /// matches `intent.solver`, and `now` is before the fill-window deadline.
+    /// Extracted so the two call sites can never silently drift apart.
+    fn check_fill_guards(intent: &IntentRecord, solver: &Address, now: u64) -> Result<(), Error> {
+        // Boundary semantics: the fill-window deadline is EXCLUSIVE for filling
+        // (issue #26) — `now >= intent.deadline` rejects at the boundary second.
+        if now >= intent.deadline {
+            return Err(Error::FillWindowExpired);
+        }
+        match &intent.state {
+            IntentState::Accepted => {}
+            IntentState::Filled => return Err(Error::IntentAlreadyFilled),
+            _ => return Err(Error::IntentNotAccepted),
+        }
+        if intent.solver.as_ref() != Some(solver) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
+    /// Add `token` to the paged persistent allowlist (#117, #373).
+    /// O(1): appends to the current tail page and writes an index entry.
+    /// No-op if `token` is already in the set (index entry present).
+    fn add_to_dst_token_list(env: &Env, token: &Address) {
+        // Idempotency: skip if already indexed.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::DstTokenListIdx(token.clone()))
+        {
+            return;
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DstTokenListCount)
+            .unwrap_or(0);
+        let pg = total / PAGED_SET_PAGE_SIZE;
+        let slot = total % PAGED_SET_PAGE_SIZE;
+        let page_key = DataKey::DstTokenListPage(pg);
+
+        let mut page: Vec<Option<Address>> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| Vec::new(env));
+        page.push_back(Some(token.clone()));
+        env.storage().persistent().set(&page_key, &page);
+        env.storage().persistent().extend_ttl(
+            &page_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        // Record the flat index for O(1) removal.
+        let flat_idx = pg * PAGED_SET_PAGE_SIZE + slot;
+        env.storage()
+            .persistent()
+            .set(&DataKey::DstTokenListIdx(token.clone()), &flat_idx);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DstTokenListIdx(token.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DstTokenListCount, &(total + 1));
+    }
+
+    /// Remove `token` from the paged persistent allowlist (#373) via swap-remove.
+    /// O(1): swaps `token` with the last element, then clears the last slot.
+    fn remove_from_dst_token_list(env: &Env, token: &Address) {
+        let idx_key = DataKey::DstTokenListIdx(token.clone());
+        let flat_idx: u32 = match env.storage().persistent().get(&idx_key) {
+            Some(v) => v,
+            None => return, // not in the set
+        };
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DstTokenListCount)
+            .unwrap_or(0);
+        let last_flat = total.saturating_sub(1);
+
+        if flat_idx != last_flat {
+            // Swap the last element into `flat_idx`.
+            let last_pg = last_flat / PAGED_SET_PAGE_SIZE;
+            let last_slot = last_flat % PAGED_SET_PAGE_SIZE;
+            let last_page_key = DataKey::DstTokenListPage(last_pg);
+            let mut last_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&last_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            let moved_token = last_page.get(last_slot).unwrap();
+
+            let target_pg = flat_idx / PAGED_SET_PAGE_SIZE;
+            let target_slot = flat_idx % PAGED_SET_PAGE_SIZE;
+            let target_page_key = DataKey::DstTokenListPage(target_pg);
+            let mut target_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&target_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            target_page.set(target_slot, moved_token.clone());
+            last_page.set(last_slot, None);
+
+            env.storage().persistent().set(&target_page_key, &target_page);
+            env.storage().persistent().extend_ttl(
+                &target_page_key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+            env.storage().persistent().set(&last_page_key, &last_page);
+
+            // Update the moved token's index.
+            if let Some(moved_addr) = moved_token {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::DstTokenListIdx(moved_addr), &flat_idx);
+            }
+        } else {
+            // Removing the last element — just clear the slot.
+            let target_pg = flat_idx / PAGED_SET_PAGE_SIZE;
+            let target_slot = flat_idx % PAGED_SET_PAGE_SIZE;
+            let target_page_key = DataKey::DstTokenListPage(target_pg);
+            let mut target_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&target_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            target_page.set(target_slot, None);
+            env.storage().persistent().set(&target_page_key, &target_page);
+        }
+
+        // Remove the index entry for `token` and decrement count.
+        env.storage().persistent().remove(&idx_key);
+        if total > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::DstTokenListCount, &last_flat);
+        }
+    }
+
+    /// Append `solver` to the enumerable solver list (#198) if not already
+    /// present. Called from `register_solver` only on a first registration, so
+    /// Add `solver` to the paged persistent solver list (#198, #373).
+    /// O(1): appends to the current tail page and writes an index entry.
+    /// No-op if `solver` is already in the set (index entry present).
+    fn add_to_solver_list(env: &Env, solver: &Address) {
+        // Idempotency: skip if already indexed.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::SolverListIdx(solver.clone()))
+        {
+            return;
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverListCount)
+            .unwrap_or(0);
+        let pg = total / PAGED_SET_PAGE_SIZE;
+        let slot = total % PAGED_SET_PAGE_SIZE;
+        let page_key = DataKey::SolverListPage(pg);
+
+        let mut page: Vec<Option<Address>> = env
+            .storage()
+            .persistent()
+            .get(&page_key)
+            .unwrap_or_else(|| Vec::new(env));
+        page.push_back(Some(solver.clone()));
+        env.storage().persistent().set(&page_key, &page);
+        env.storage().persistent().extend_ttl(
+            &page_key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        let flat_idx = pg * PAGED_SET_PAGE_SIZE + slot;
+        env.storage()
+            .persistent()
+            .set(&DataKey::SolverListIdx(solver.clone()), &flat_idx);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SolverListIdx(solver.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SolverListCount, &(total + 1));
+    }
+
+    /// Remove `solver` from the paged persistent solver list (#373) via swap-remove.
+    /// O(1): swaps `solver` with the last element, then clears the last slot.
+    fn remove_from_solver_list(env: &Env, solver: &Address) {
+        let idx_key = DataKey::SolverListIdx(solver.clone());
+        let flat_idx: u32 = match env.storage().persistent().get(&idx_key) {
+            Some(v) => v,
+            None => return,
+        };
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SolverListCount)
+            .unwrap_or(0);
+        let last_flat = total.saturating_sub(1);
+
+        if flat_idx != last_flat {
+            let last_pg = last_flat / PAGED_SET_PAGE_SIZE;
+            let last_slot = last_flat % PAGED_SET_PAGE_SIZE;
+            let last_page_key = DataKey::SolverListPage(last_pg);
+            let mut last_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&last_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            let moved_solver = last_page.get(last_slot).unwrap();
+
+            let target_pg = flat_idx / PAGED_SET_PAGE_SIZE;
+            let target_slot = flat_idx % PAGED_SET_PAGE_SIZE;
+            let target_page_key = DataKey::SolverListPage(target_pg);
+            let mut target_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&target_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            target_page.set(target_slot, moved_solver.clone());
+            last_page.set(last_slot, None);
+
+            env.storage().persistent().set(&target_page_key, &target_page);
+            env.storage().persistent().extend_ttl(
+                &target_page_key,
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_EXTEND_TO,
+            );
+            env.storage().persistent().set(&last_page_key, &last_page);
+
+            if let Some(moved_addr) = moved_solver {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::SolverListIdx(moved_addr), &flat_idx);
+            }
+        } else {
+            let target_pg = flat_idx / PAGED_SET_PAGE_SIZE;
+            let target_slot = flat_idx % PAGED_SET_PAGE_SIZE;
+            let target_page_key = DataKey::SolverListPage(target_pg);
+            let mut target_page: Vec<Option<Address>> = env
+                .storage()
+                .persistent()
+                .get(&target_page_key)
+                .unwrap_or_else(|| Vec::new(env));
+            target_page.set(target_slot, None);
+            env.storage().persistent().set(&target_page_key, &target_page);
+        }
+
+        env.storage().persistent().remove(&idx_key);
+        if total > 0 {
+            env.storage()
+                .persistent()
+                .set(&DataKey::SolverListCount, &last_flat);
+        }
+    }
+
+    /// Issue #368/#549: `amount` of `dst_token` valued in `bond_token` units
+    /// for exposure accounting. Uses the configured oracle's cross-rate for
+    /// cross-token intents; on a missing / stale / invalid price (or no oracle)
+    /// it applies the conservative 1.0× weight, so the check still runs.
+    fn exposure_notional(env: &Env, dst_token: &Address, bond_token: &Address, amount: i128) -> i128 {
+        let oracle_addr = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::OracleAddr);
+        let weight = oracle::weight_bps(env, oracle_addr.as_ref(), dst_token, bond_token);
+        amount
+            .checked_mul(weight)
+            .unwrap_or(amount)
+            .checked_div(BPS_DENOMINATOR)
+            .unwrap_or(amount)
     }
 
     fn get_adjusted_min_bond(env: &Env, dst_token: &Address) -> i128 {

@@ -200,10 +200,13 @@ resolution only from the registered panel contract.
 simplest safe option for testnet — it required no new storage key or governance
 mechanism.
 
-**v2 (current):** The `arbiter_panel` contract holds the arbiter role. The
-settlement contract stores the panel contract address (settable by admin via
-`set_arbiter_panel(env, panel: Address)`) and accepts `resolve_dispute` only
-from it. The panel is an m-of-n bonded committee; see
+**v2 (implemented in `arbiter_panel/`, issue #555):** The `arbiter_panel`
+contract holds the arbiter role once the admin calls
+`set_arbiter_panel(env, panel: Address)` on `intent_settlement`; from then on
+`resolve_dispute` accepts a resolution only from that address (otherwise it
+panics with `NotArbiter`). **Until `set_arbiter_panel` is called, the legacy v1
+behaviour remains in effect:** the arbiter is the address set via `set_arbiter`
+or, by default, the `Admin`. The panel is an m-of-n bonded committee; see
 [Arbiter panel](#arbiter-panel-m-of-n-bonded-arbiters).
 
 **Arbiter governance:** See [`docs/arbiter-code-of-conduct.md`](./arbiter-code-of-conduct.md)
