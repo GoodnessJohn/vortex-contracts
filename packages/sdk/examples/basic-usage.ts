@@ -58,41 +58,36 @@ async function main() {
     min_dst_amount: 3_500_000_000n, // 3500 USDC minimum
   };
 
-  try {
-    // Note: This will throw in current reference implementation
-    const intentId = await client.submitIntent(submitOptions, userKeypair);
-    console.log(`   Intent submitted: ${intentId}\n`);
+  const intentId = await client.submitIntent(submitOptions, userKeypair);
+  console.log(`   Intent submitted: ${intentId}\n`);
 
-    // 5. Solver accepts the intent
-    console.log('5. Accepting intent...');
-    const acceptOptions: AcceptIntentOptions = {
-      solver: solverKeypair.publicKey(),
-      intent_id: intentId,
-    };
+  // 5. Solver accepts the intent
+  console.log('5. Accepting intent...');
+  const acceptOptions: AcceptIntentOptions = {
+    solver: solverKeypair.publicKey(),
+    intent_id: intentId,
+  };
 
-    await client.acceptIntent(acceptOptions, solverKeypair);
-    console.log(`   Intent accepted\n`);
+  await client.acceptIntent(acceptOptions, solverKeypair);
+  console.log(`   Intent accepted\n`);
 
-    // 6. Solver fills the intent
-    console.log('6. Filling intent...');
-    const fillOptions: FillIntentOptions = {
-      solver: solverKeypair.publicKey(),
-      intent_id: intentId,
-      fill_amount: 3_500_000_000n, // Deliver minimum amount
-    };
+  // 6. Solver fills the intent
+  console.log('6. Filling intent...');
+  const fillOptions: FillIntentOptions = {
+    solver: solverKeypair.publicKey(),
+    intent_id: intentId,
+    fill_amount: 3_500_000_000n, // Deliver minimum amount
+  };
 
-    await client.fillIntent(fillOptions, solverKeypair);
-    console.log(`   Intent filled\n`);
+  await client.fillIntent(fillOptions, solverKeypair);
+  console.log(`   Intent filled\n`);
 
-    // 7. Query the filled intent
-    console.log('7. Querying filled intent...');
-    const filledIntent = await client.getIntent(intentId);
-    if (filledIntent) {
-      console.log(`   Intent state: ${filledIntent.state}`);
-      console.log(`   Filled by: ${filledIntent.accepted_by}\n`);
-    }
-  } catch (error) {
-    console.log(`   (Skipped - Reference implementation not yet complete)\n`);
+  // 7. Query the filled intent
+  console.log('7. Querying filled intent...');
+  const filledIntent = await client.getIntent(intentId);
+  if (filledIntent) {
+    console.log(`   Intent state: ${filledIntent.state}`);
+    console.log(`   Filled by: ${filledIntent.accepted_by}\n`);
   }
 
   // 8. Query solver record

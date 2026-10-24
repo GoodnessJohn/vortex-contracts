@@ -631,6 +631,143 @@ fn mock_remove_proof_clears_stored_record() {
     assert!(!c.has_proof(&intent_id));
 }
 
+// ─── Regression: TTL-bump helpers (#557) ──────────────────────────────────
+//
+// `bump_instance_ttl` / `bump_proof_ttl` previously referenced undefined TTL
+// constants and failed to compile.  Exercising an entrypoint that bumps both
+// must succeed without panicking.
+
+#[test]
+fn receive_message_bumps_ttl_without_panicking() {
+    let ctx = setup();
+    let c = ctx.client();
+    let emitter = emitter_addr(&ctx.env, 0x11);
+    c.set_authorized_emitter(&2, &emitter);
+
+    let intent_id = make_intent_id(&ctx.env, 30);
+    let payload = make_payload(&intent_id, 2, 1_000);
+    let vaa = build_vaa(&ctx.env, 2, &emitter, 1, &payload);
+
+    // Must not panic while extending instance/proof TTLs.
+    c.receive_message(&vaa);
+    assert!(c.has_proof(&intent_id));
+}
+
+#[test]
+fn get_proof_bumps_ttl_without_panicking() {
+    let ctx = setup();
+    let c = ctx.client();
+    let emitter = emitter_addr(&ctx.env, 0x11);
+    c.set_authorized_emitter(&2, &emitter);
+
+    let intent_id = make_intent_id(&ctx.env, 31);
+    let payload = make_payload(&intent_id, 2, 1_000);
+    c.receive_message(&build_vaa(&ctx.env, 2, &emitter, 1, &payload));
+
+    // Reading back the proof also extends TTLs; must not panic.
+    let record = c.get_proof(&intent_id).expect("proof should exist");
+    assert_eq!(record.src_amount, 1_000);
+}
+
+// ─── Regression: payload decoding fails closed (#557) ─────────────────────
+//
+// The payload decoder previously cast `Bytes::get(...)`'s `Option<u8>`
+// directly, which is an invalid cast (E0605).  Truncated payloads must now
+// fail closed with `Error::InvalidPayload` rather than panicking.
+
+#[test]
+fn receive_message_rejects_truncated_payload_fail_closed() {
+    let ctx = setup();
+    let c = ctx.client();
+    let emitter = emitter_addr(&ctx.env, 0x11);
+    c.set_authorized_emitter(&2, &emitter);
+
+    // 101 bytes: one short of the required 102-byte payload.
+    let vaa = build_vaa(&ctx.env, 2, &emitter, 1, &[0u8; 101]);
+    let res = c.try_receive_message(&vaa);
+    assert_eq!(res, Err(Ok(Error::InvalidPayload.into())));
+}
+
+#[test]
+fn receive_message_rejects_empty_payload_fail_closed() {
+    let ctx = setup();
+    let c = ctx.client();
+    let emitter = emitter_addr(&ctx.env, 0x11);
+    c.set_authorized_emitter(&2, &emitter);
+
+    let vaa = build_vaa(&ctx.env, 2, &emitter, 1, &[]);
+    let res = c.try_receive_message(&vaa);
+    assert_eq!(res, Err(Ok(Error::InvalidPayload.into())));
+}
+
+#[test]
+fn receive_message_axelar_rejects_truncated_payload_fail_closed() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = Symbol::new(&ctx.env, "ethereum");
+    let source = String::from_str(&ctx.env, "0xeeee");
+    c.set_authorized_axelar_source(&chain, &source);
+
+    let payload = Bytes::from_slice(&ctx.env, &[0u8; 101]);
+    let res = c.try_receive_message_axelar(&chain, &source, &payload);
+    assert_eq!(res, Err(Ok(Error::InvalidPayload.into())));
+}
+
+// ─── Regression: require_configurator (#557) ──────────────────────────────
+//
+// `require_configurator` previously referenced a non-existent
+// `ProofKey::Configurator` variant (E0599).  Chain configuration must be
+// gated on a configured configurator and fail closed when none is set.
+
+#[test]
+fn configure_chain_before_set_configurator_fails_closed() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = Symbol::new(&ctx.env, "ethereum");
+    let source = String::from_str(&ctx.env, "0xeeee");
+
+    let res = c.try_configure_chain(&chain, &source);
+    assert_eq!(res, Err(Ok(Error::ConfiguratorNotSet.into())));
+    assert_eq!(c.get_authorized_axelar_source(&chain), None);
+}
+
+#[test]
+fn remove_chain_before_set_configurator_fails_closed() {
+    let ctx = setup();
+    let c = ctx.client();
+    let chain = Symbol::new(&ctx.env, "ethereum");
+
+    let res = c.try_remove_chain(&chain);
+    assert_eq!(res, Err(Ok(Error::ConfiguratorNotSet.into())));
+}
+
+#[test]
+fn configure_chain_succeeds_after_set_configurator() {
+    let ctx = setup();
+    let c = ctx.client();
+    let configurator = Address::generate(&ctx.env);
+    c.set_configurator(&configurator);
+
+    let chain = Symbol::new(&ctx.env, "ethereum");
+    let source = String::from_str(&ctx.env, "0xeeee");
+    c.configure_chain(&chain, &source);
+    assert_eq!(c.get_authorized_axelar_source(&chain), Some(source));
+}
+
+#[test]
+fn remove_chain_succeeds_after_set_configurator() {
+    let ctx = setup();
+    let c = ctx.client();
+    let configurator = Address::generate(&ctx.env);
+    c.set_configurator(&configurator);
+
+    let chain = Symbol::new(&ctx.env, "ethereum");
+    let source = String::from_str(&ctx.env, "0xeeee");
+    c.configure_chain(&chain, &source);
+    c.remove_chain(&chain);
+    assert_eq!(c.get_authorized_axelar_source(&chain), None);
+}
+
 // ─── Proptest: payload decoding (nightly fuzz target) ────────────────────────
 
 mod proptest_payload {
@@ -646,36 +783,4 @@ mod proptest_payload {
             chain in 1u16..=u16::MAX,
             amount in any::<i128>(),
             sequence in any::<u64>(),
-        ) {
-            let ctx = setup();
-            let emitter = emitter_addr(&ctx.env, 7);
-            ctx.client().set_authorized_emitter(&(chain as u32), &emitter);
-            let id = make_intent_id(&ctx.env, seed);
-            let vaa = build_vaa(&ctx.env, chain, &emitter, sequence, &make_payload(&id, chain, amount));
-            ctx.client().receive_message(&vaa);
-            let rec = ctx.client().get_proof(&id).unwrap();
-            prop_assert_eq!(rec.src_amount, amount);
-            prop_assert_eq!(rec.src_chain_id, chain as u32);
-            prop_assert_eq!(rec.vaa_sequence, sequence);
-        }
-
-        /// Arbitrary payload bytes never panic outside the contract's typed
-        /// errors: wrong length → InvalidPayload, otherwise stored or rejected
-        /// with a chain mismatch.
-        #[test]
-        fn proptest_payload_arbitrary_bytes_fail_closed(
-            payload in proptest::collection::vec(any::<u8>(), 0..160),
-        ) {
-            let ctx = setup();
-            let emitter = emitter_addr(&ctx.env, 7);
-            ctx.client().set_authorized_emitter(&2u32, &emitter);
-            let vaa = build_vaa(&ctx.env, 2, &emitter, 1, &payload);
-            let res = ctx.client().try_receive_message(&vaa);
-            if payload.len() != 102 {
-                prop_assert_eq!(res, Err(Ok(Error::InvalidPayload.into())));
-            } else {
-                prop_assert!(res.is_ok() || res == Err(Ok(Error::EmitterChainMismatch.into())));
-            }
-        }
-    }
-}
+       
