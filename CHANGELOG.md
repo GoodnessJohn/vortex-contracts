@@ -19,6 +19,47 @@ first deploys to mainnet.
   governance timelock: both a magnitude cap and a notice window apply. Limits are
   hardcoded and documented for v1; making them governance-configurable is out of
   scope.
+
+- **`governor` contract — on-chain proposal/voting lifecycle (issue #508).**
+  New `governor/` crate implementing proposal creation, per-address voting,
+  quorum tracking, and permissionless execution once a proposal passes. Core
+  state machine (`Pending → Active → Succeeded/Defeated → Queued → Executed`)
+  is present. Known gaps: quorum/threshold constants are not yet tuneable via
+  admin config, and the execution hook into `intent_settlement` admin operations
+  is not wired. Not yet production-ready; tracked in issue #508.
+
+- **`backstop_vault` contract — last-resort collateral reserve (issue #508).**
+  New `backstop_vault/` crate providing a deposit/withdraw vault that can be
+  drawn on to cover under-collateralised slash shortfalls. Collusion-risk
+  mitigations documented in `docs/369-backstop-collusion-analysis.md` are not
+  yet fully implemented; the redemption-under-shortfall path requires further
+  hardening before mainnet use. Not yet production-ready; tracked in issue #508.
+
+- **`treasury_streams` contract — continuous protocol-fee streaming (issue #508).**
+  New `treasury_streams/` crate supporting creation and cancellation of
+  per-second token streams to designated recipients. Stream creation and
+  cancellation are functional. Rate-change governance hook and safe-transfer
+  edge cases (zero-balance flush, stream expiry without explicit cancel) need
+  review. Not yet production-ready; tracked in issue #508.
+
+- **`fee_router` contract — protocol-fee distribution router (issue #508).**
+  New `fee_router/` crate routing incoming protocol fees to `treasury_streams`
+  and/or `backstop_vault` according to an admin-configured split ratio. Core
+  routing logic is present. Split-update timelock and multi-recipient input
+  validation are incomplete. Not yet production-ready; tracked in issue #508.
+
+- **`timelock` contract — standalone timelock controller (issue #508).**
+  New `timelock/` crate providing a configurable-delay execution controller,
+  distinct from the `propose_*/execute_*` pattern embedded in
+  `intent_settlement`. Intended to wrap `governor` proposal execution. Delay
+  parameterisation and the cancellation path require final review before
+  production use. Not yet production-ready; tracked in issue #508.
+
+- **`intent_periphery` contract — intent convenience layer (issue #508).**
+  New `intent_periphery/` crate exposing higher-level helpers built on top of
+  `intent_settlement` (e.g. single-call submit-and-accept flows for testing and
+  integrations). Not yet production-ready; tracked in issue #508.
+
 - **CI: Enforce CHANGELOG.md updates (issue #294).** A new CI job verifies that
   every PR changing `intent_settlement/src/` or `proof_registry/src/` includes a
   corresponding update to `CHANGELOG.md`. An escape hatch (`no-changelog-needed`
@@ -45,6 +86,19 @@ first deploys to mainnet.
 
 ### Changed
 
+- **`fee_router` rewritten as a real Soroban contract (issue #464).**
+  `fee_router/src/lib.rs` is now a deployable `#![no_std]` contract with
+  `#[contract]`/`#[contractimpl]` instead of plain `std` Rust. Sinks and the
+  governance address are `soroban_sdk::Address` (was `String`), transfers go
+  through `token::Client` (was a caller-supplied `FnOnce` closure), and all
+  state (weights, governance, timelock, claimable balances) lives in Soroban
+  storage (was in-memory `BTreeMap`s). The pull-based `claimable` accounting,
+  timelocked `propose_weights`/`apply_weights`, and dust-to-first-sink
+  conservation are preserved. The inline test scenarios
+  (`distribute_conserves_balance`, `weights_must_sum_to_total`,
+  `timelock_enforced`, `rejected_transfer_keeps_share_claimable`) are ported to
+  `soroban_sdk::testutils`. Fee-on-transfer tokens are handled by crediting the
+  amount actually received (balance delta) rather than the requested amount.
 - **Storage layout — `SolverRecord` / `IntentRecord` (issue #187, #188).**
   `SolverRecord` gains a `bond_tokens: Vec<Address>` field enumerating every
   approved token a solver holds a bond in; `bond_amount` is retained as the
@@ -130,11 +184,11 @@ first deploys to mainnet.
   and `migrate()` guard) matching the pattern in `intent_settlement`. Allows 
   `proof_registry` to evolve without data loss or re-initialization. Migration 
   guard prevents double-execution on the same version.
-- **Storage TTL management**: persistent `Intent`/`Solver` entries and the
-  contract instance now have their TTL extended on every write, closing a
+- **Storage TTL management**: persistent `Intent`/`Solver` entries and the 
+  contract instance now have their TTL extended on every write, closing a 
   gap where none of Soroban's state-archival requirements were handled.
 - **Admin key management**: `set_fee_recipient`, `transfer_admin`
-  (requires auth from both the outgoing and incoming admin), and
-  `get_admin`/`get_fee_recipient` views -- previously no rotation path
+  (requires auth from both the outgoing and incoming admin), and 
+  `get_admin`/`get_fee_recipient` views -- previously no rotation path 
   existed for either role.
-- **Emergency pause**: `pause()`/`unpause()`/`is_paused()`, 
+- **Emergency pause**: `pause()`/`unpause()`/`is_paused()`,
