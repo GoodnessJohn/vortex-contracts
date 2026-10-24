@@ -12,24 +12,43 @@
 #   make test     — run unit / integration tests
 #   make build    — compile the release wasm binary
 #   make deploy-testnet — deploy to Stellar testnet (requires STELLAR_SOURCE)
+#
+# Proof Registry targets (issue #213):
+#   make proof-registry-fmt      — format proof_registry source
+#   make proof-registry-lint     — clippy proof_registry
+#   make proof-registry-test     — test proof_registry
+#   make proof-registry-build    — build proof_registry wasm
+#   make proof-registry-all      — full check for proof_registry
 
-.DEFAULT_GOAL := help
+.PHONY: build-wasms integration-test
+
+build-wasms:
+	cargo build --release --target wasm32-unknown-unknown \
+		-p registry -p intent_settlement -p proofs -p badges
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 WORKSPACE       := intent_settlement
+PROOF_REGISTRY  := proof_registry
 WASM_TARGET     := wasm32-unknown-unknown
 WASM_OUT        := $(WORKSPACE)/target/$(WASM_TARGET)/release/vortex_intent_settlement.wasm
+PR_WASM_OUT     := $(PROOF_REGISTRY)/target/$(WASM_TARGET)/release/vortex_proof_registry.wasm
 STELLAR_NETWORK ?= testnet
 # Set STELLAR_SOURCE to your secret key or key-name before running deploy-testnet
 STELLAR_SOURCE  ?=
+
+# Crates that carry Kani harnesses and/or property-based tests (issue #544).
+KANI_CRATES     := intent_settlement solver_registry proof_registry
 
 # ── Compound targets ──────────────────────────────────────────────────────────
 
 .PHONY: all
 all: fmt lint test build  ## Run fmt, lint, test, and build (full pre-push check)
 
-# ── Individual targets ────────────────────────────────────────────────────────
+.PHONY: proof-registry-all
+proof-registry-all: proof-registry-fmt proof-registry-lint proof-registry-test proof-registry-build  ## Full check for proof_registry
+
+# ── Individual targets (intent_settlement) ─────────────────────────────────────
 
 .PHONY: fmt
 fmt:  ## Format all source files with rustfmt
@@ -55,9 +74,53 @@ build:  ## Build the release wasm binary
 audit:  ## Run cargo-audit against the dependency tree
 	cd $(WORKSPACE) && cargo audit
 
+# ── Generated documentation (issue #531) ─────────────────────────────────────
+#
+# README.md's "Error Reference" table is generated from the `Error` enum in
+# intent_settlement/src/lib.rs.  `error-reference-check` fails when the two
+# have drifted apart; `error-reference` rewrites the table.
+
+.PHONY: error-reference
+error-reference:  ## Regenerate README.md's Error Reference table from the Error enum
+	python3 scripts/generate-error-reference.py --write
+
+.PHONY: error-reference-check
+error-reference-check:  ## Verify README.md's Error Reference table matches the Error enum
+	python3 scripts/generate-error-reference.py --check
+
 .PHONY: clean
 clean:  ## Remove build artefacts
 	cd $(WORKSPACE) && cargo clean
+
+# ── Proof Registry targets (issue #213) ────────────────────────────────────────
+
+.PHONY: proof-registry-fmt
+proof-registry-fmt:  ## Format proof_registry source files
+	cd $(PROOF_REGISTRY) && cargo fmt --all
+
+.PHONY: proof-registry-fmt-check
+proof-registry-fmt-check:  ## Check proof_registry formatting without modifying
+	cd $(PROOF_REGISTRY) && cargo fmt --all -- --check
+
+.PHONY: proof-registry-lint
+proof-registry-lint:  ## Run clippy on proof_registry
+	cd $(PROOF_REGISTRY) && cargo clippy --all-targets -- -D warnings
+
+.PHONY: proof-registry-test
+proof-registry-test:  ## Run proof_registry test suite
+	cd $(PROOF_REGISTRY) && cargo test
+
+.PHONY: proof-registry-build
+proof-registry-build:  ## Build proof_registry release wasm
+	cd $(PROOF_REGISTRY) && cargo build --target $(WASM_TARGET) --release
+
+.PHONY: proof-registry-audit
+proof-registry-audit:  ## Run cargo-audit on proof_registry
+	cd $(PROOF_REGISTRY) && cargo audit
+
+.PHONY: proof-registry-clean
+proof-registry-clean:  ## Remove proof_registry build artefacts
+	cd $(PROOF_REGISTRY) && cargo clean
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 
@@ -93,9 +156,13 @@ local-network-logs:  ## Tail local network logs
 local-network-status:  ## Check local network status
 	./setup-local-network.sh status
 
-# ── Help ──────────────────────────────────────────────────────────────────────
+# ── Integration tests ────────────────────────────────────────────────────────
 
-# ── Kani model checking (issue #415) ────────────────────────────────────────
+.PHONY: integration-test
+integration-test: build-wasms  ## Run the integration test suite against freshly built wasms
+	cargo test -p integration-tests
+
+# ── Kani model checking (issues #415, #544) ─────────────────────────────────
 
 .PHONY: kani
 kani:  ## Run Kani proof harnesses for pure arithmetic helpers (requires kani-verifier)
@@ -103,19 +170,54 @@ kani:  ## Run Kani proof harnesses for pure arithmetic helpers (requires kani-ve
 		echo "Kani not found. Install with: cargo install --locked kani-verifier && cargo kani setup"; \
 		exit 1; \
 	}
-	cd $(WORKSPACE) && cargo kani \
-		--harness kani_slash_never_negative \
-		--harness kani_slash_never_exceeds_bond \
-		--harness kani_slash_floor_one \
-		--harness kani_tier_fill_window_monotone \
-		--harness kani_tier_fill_window_no_overflow \
-		--harness kani_fee_never_exceeds_amount \
-		--harness kani_fee_rounding_direction \
-		--harness kani_dutch_decay_bounds \
-		--harness kani_discount_in_range \
-		--harness kani_decode_payload_roundtrip \
-		--harness kani_slash_bps_monotone \
-		--harness kani_decode_i128_be_bounds_safe
+	@set -e; \
+	for crate in $(KANI_CRATES); do \
+		echo "==> cargo kani in $$crate"; \
+		case $$crate in \
+			intent_settlement) \
+				harnesses=" \
+					--harness kani_slash_never_negative \
+					--harness kani_slash_never_exceeds_bond \
+					--harness kani_slash_floor_one \
+					--harness kani_tier_fill_window_monotone \
+					--harness kani_tier_fill_window_no_overflow \
+					--harness kani_fee_never_exceeds_amount \
+					--harness kani_fee_rounding_direction \
+					--harness kani_dutch_decay_bounds \
+					--harness kani_discount_in_range \
+					--harness kani_decode_payload_roundtrip \
+					--harness kani_slash_bps_monotone \
+					--harness kani_decode_i128_be_bounds_safe" ;; \
+			solver_registry) \
+				harnesses=" \
+					--harness kani_slash_bps_never_negative \
+					--harness kani_slash_bps_never_exceeds_bond \
+					--harness kani_slash_bps_monotone \
+					--harness kani_tier_threshold_monotone \
+					--harness kani_tier_lookup_in_range \
+					--harness kani_bond_never_negative" ;; \
+			proof_registry) \
+				harnesses=" \
+					--harness kani_slash_percentage_never_negative \
+					--harness kani_slash_percentage_never_exceeds_bond \
+					--harness kani_slash_percentage_monotone \
+					--harness kani_bond_never_negative \
+					--harness kani_bond_addition_no_overflow" ;; \
+			*) \
+				harnesses="" ;; \
+		esac; \
+		( cd $$crate && cargo kani $$harnesses ); \
+	done
+
+# ── Property-based tests (issue #544) ───────────────────────────────────────
+
+.PHONY: proptest
+proptest:  ## Run property-based tests across all Kani-covered crates
+	@set -e; \
+	for crate in $(KANI_CRATES); do \
+		echo "==> cargo test --features testutils in $$crate"; \
+		( cd $$crate && cargo test --features testutils ); \
+	done
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 
@@ -126,3 +228,5 @@ help:  ## Show this help message
 	@echo "Targets:"
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*##"}; {printf "  %-20s %s\n", $$1, $$2}'
+	@echo ""
+	@echo "Kani-covered crates (KANI_CRATES): $(KANI_CRATES)"

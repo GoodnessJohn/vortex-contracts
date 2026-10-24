@@ -287,341 +287,60 @@ stateDiagram-v2
 
 #### Error Reference
 
-The table below maps every `Error` variant to the function(s) that raise it and
-the exact condition that triggers it.
-
-| # | Variant | Raised by | Condition |
-|---|---------|-----------|-----------|
-| 1 | `AlreadyInitialized` | `initialize` | `DataKey::Admin` already exists in instance storage |
-| 2 | `Unauthorized` | `fill_intent`, `cancel_intent` | Caller is not the assigned solver / intent owner |
-| 3 | `IntentNotFound` | `accept_intent`, `fill_intent`, `cancel_intent`, `slash_solver`, `expire_intent` | No `IntentRecord` found for the supplied `intent_id` |
-| 4 | `IntentNotOpen` | `cancel_intent`, `expire_intent` | Intent state is not `Open` |
-| 5 | `IntentExpired` | `accept_intent` | `now >= intent.deadline` when a solver tries to accept |
-| 6 | `IntentNotAccepted` | `fill_intent`, `slash_solver` | Intent state is not `Accepted` |
-| 7 | `SolverNotRegistered` | `accept_intent`, `deregister_solver`, `withdraw_bond` | No `SolverRecord` found for the address |
-| 8 | `SolverBondTooLow` | `register_solver`, `withdraw_bond` | Resulting bond total < `MIN_BOND` (50 USDC) |
-| 9 | `InsufficientOutput` | `fill_intent` | `fill_amount < intent.min_dst_amount` |
-| 10 | `FillWindowExpired` | `fill_intent` | `now >= intent.deadline` (fill window elapsed); also used in `slash_solver` as an inverse guard (window not yet expired) |
-| 11 | `CannotCancelAccepted` | `cancel_intent` | Intent state is `Accepted` |
-| 12 | `SolverInactive` | `accept_intent` | `solver_record.is_active == false` |
-| 13 | `ZeroAmount` | `submit_intent`, `register_solver`, `withdraw_bond` | `src_amount ≤ 0`, `min_dst_amount ≤ 0`, or `bond_amount ≤ 0` |
-| 14 | `InvalidDeadline` | `submit_intent` | Supplied `deadline ≤ env.ledger().timestamp()` |
-| 15 | `IntentAlreadyFilled` | `fill_intent` | Intent state is `Filled` |
-| 16 | `NotInitialized` | `propose_fee_recipient`, `propose_admin_transfer`, `require_admin` | `DataKey::Admin` absent (contract not initialized) |
-| 17 | `SolverHasActiveIntents` | `deregister_solver` | `solver_record.active_intents > 0` |
-| 18 | `ContractPaused` | `submit_intent`, `accept_intent`, `fill_intent` (via `require_not_paused`) | `DataKey::Paused` is `true` |
-| 19 | `DeadlineNotReached` | `expire_intent` | `now < intent.deadline` |
-| 20 | `InsufficientBond` | `withdraw_bond` | Requested withdrawal `amount > solver_record.bond_amount` |
-| 21 | `DstTokenNotAllowed` | `submit_intent` | `DstAllowlistEnabled` is `true` and `dst_token` is not in the `AllowedDstToken` list |
-| 22 | `IntentAlreadyExists` | `submit_intent` | Hash collision: an intent with this `intent_id` was already submitted |
-| 23 | `FeeOverflow` | `fill_intent` | Fee arithmetic overflowed (fill amount astronomically large) |
-| 24 | `InvalidTokenInterface` | `add_allowed_dst_token` | Token address does not implement SEP-41 |
-| 25 | `NoPendingFeeRecipient` | `accept_fee_recipient` | No prior `propose_fee_recipient` on record |
-| 26 | `SrcChainNotAllowed` | `submit_intent` | `SrcChainAllowlistEnabled` is `true` and `src_chain` is not in the allowlist |
-| 27 | `RescueProtectedToken` | `rescue_tokens` | Token is the bond token or an active intent's dst_token |
-| 28 | `InvalidSrcToken` | `submit_intent` | `src_token` format does not match the declared `src_chain`'s conventions |
-| 29 | `BatchSizeExceeded` | `batch_submit_intent`, `batch_accept_intent` | Batch size exceeds `MAX_BATCH_SIZE` |
-| 30 | `ExtensionAlreadyGranted` | `request_extension` | Intent has already used its one-time extension |
-| 31 | `InvalidConfig` | `set_config` | Invalid protocol configuration parameters |
-| 32 | `TimelockNotElapsed` | `accept_fee_recipient`, `accept_admin_transfer`, `execute_add_dst_token`, `execute_remove_dst_token` | Called before the `#115` timelock delay since the matching `propose_*` call has elapsed |
-| 33 | `NoPendingAdminTransfer` | `accept_admin_transfer` | No prior `propose_admin_transfer` on record |
-| 34 | `NoPendingDstTokenChange` | `execute_add_dst_token`, `execute_remove_dst_token` | No matching pending proposal for the given token |
-| 35 | `CancelCooldownNotExpired` | `cancel_intent` | Cannot cancel an Accepted intent whose solver was recently slashed (cooldown active) |
-| 36 | `AmountTooLarge` | `submit_intent` | Numeric input (e.g. `src_amount`) is too large to safely handle |
-
----
-
-### `solver_registry`
-
-Canonical store for solver **tiers** (Unranked → Platinum) and the per-tier
-perk schedule. `intent_settlement` calls `get_tier(solver)` from
-`accept_intent` / `slash_solver` to grant fill-window bonuses and reduced slash
-rates (#197). Tiers are currently admin-set (`set_tier`); score-gated automatic
-promotion, staking, and migration remain future work (#186). See
-[`docs/solver-registry-design.md`](./docs/solver-registry-design.md).
-
-- `initialize(admin)`
-- `set_tier(solver, tier)` / `clear_tier(solver)` — admin-only
-- `get_tier(solver) -> u32` — defaults to `0` (Unranked)
-- `get_fill_window_bonus_bps(tier)` / `get_slash_bps(tier)` — the perk schedule
-
----
-
-## Supported Source Chains
-
-The `src_chain` field in `submit_intent` must use the canonical lowercase string
-for the source chain. When `SrcChainAllowlistEnabled` is `true`, only the chains
-registered via `add_allowed_src_chain()` are accepted.
-
-| `src_chain` value | Network | Chain type | `src_token` format |
-|---|---|---|---|
-| `"ethereum"` | Ethereum Mainnet | EVM | `0x` + 40 hex chars (EIP-55 checksum) |
-| `"base"` | Base Mainnet | EVM L2 | `0x` + 40 hex chars |
-| `"polygon"` | Polygon PoS | EVM | `0x` + 40 hex chars |
-| `"arbitrum"` | Arbitrum One | EVM L2 | `0x` + 40 hex chars |
-| `"optimism"` | OP Mainnet | EVM L2 | `0x` + 40 hex chars |
-| `"avalanche"` | Avalanche C-Chain | EVM | `0x` + 40 hex chars |
-| `"bsc"` | BNB Smart Chain | EVM | `0x` + 40 hex chars |
-| `"solana"` | Solana Mainnet Beta | SVM | base58 SPL mint, 32–44 chars, no `0x` |
-
-`submit_intent` format-validates `src_token` on-chain for the five EVM chains
-above (`ethereum`/`base`/`polygon`/`arbitrum`/`optimism`) and for `solana`
-(base58 alphabet, 32–44 chars). `avalanche` and `bsc` are accepted but their
-`src_token` is not yet format-checked on-chain.
-
-For the full token address reference (contract addresses, decimals per chain,
-Solana SPL mints, and allowlist management commands) see
-[docs/132-supported-chains.md](./docs/132-supported-chains.md).
-
-> **Decimal reminder:** EVM tokens use 18 decimals for native assets and
-> typically 6 for stablecoins — except on BSC where USDT and USDC are 18
-> decimals. Always verify via the token contract's `decimals()` call. See the
-> [Decimal Normalization](#decimal-normalization-for-src_amount) section above.
-
----
-
-## Build & Test
-
-### Prerequisites
-
-- Rust 1.78+ with the `wasm32-unknown-unknown` target
-- [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools/cli/stellar-cli)
-- [GNU Make](https://www.gnu.org/software/make/) or [`just`](https://just.systems/) (optional shortcuts)
-
-### Shortcut commands (recommended)
-
-A `Makefile` and `justfile` are provided at the repo root so you can run the
-full pre-push check with a single command:
-
-```bash
-make all          # fmt + lint + test + build
-# or, with just:
-just all
-```
-
-Individual targets:
-
-```bash
-make fmt          # cargo fmt --all
-make lint         # cargo clippy --all-targets -- -D warnings
-make test         # cargo test
-make build        # cargo build --target wasm32-unknown-unknown --release
-make help         # list all targets
-```
-
-### Raw commands
-
-If you prefer to run commands directly (or don't have Make/just installed):
-
-```bash
-cd intent_settlement
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test
-stellar contract build
-```
-
-### Deploy (testnet)
-
-Using the Makefile shortcut:
-
-```bash
-export STELLAR_SOURCE=<SECRET_KEY>
-make deploy-testnet
-# or:
-just deploy-testnet STELLAR_SOURCE=<SECRET_KEY>
-```
-
-Or run the raw command directly:
-#### Automated (recommended)
-
-A config-driven script handles the build, deploy, and `initialize()` call in
-one step, reducing copy-paste errors across repeated deployments.
-
-```bash
-# 1. Create your config file (only needs to be done once)
-cp deploy-testnet.env.example deploy-testnet.env
-$EDITOR deploy-testnet.env          # fill in admin, fee_recipient, bond_token, secret key
-
-# 2. Deploy + initialize
-./deploy-testnet.sh
-
-# 3. Skip the build if the wasm is already built
-./deploy-testnet.sh --skip-build
-```
-
-The script saves the deployed contract ID to `.last-deploy-testnet` for
-reference. See `deploy-testnet.env.example` for all available options.
-
-#### Manual
-
-```bash
-stellar contract deploy \
-  --wasm intent_settlement/target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
-  --source <SECRET_KEY> \
-  --network testnet
-```
-
-For a step-by-step mainnet promotion checklist (initialize parameters, bond
-token verification, post-deploy sanity checks, rollback procedures), see
-[`docs/mainnet-deployment-runbook.md`](./docs/mainnet-deployment-runbook.md).
-### Reproducible build verification
-
-Independently verify that your local build matches a deployed contract's
-on-chain binary (supply-chain integrity check):
-
-```bash
-# Print the SHA-256 of the locally-built wasm
-./verify-build.sh
-
-# Compare against a deployed contract
-./verify-build.sh <CONTRACT_ID>
-```
-
-The script pins the Rust toolchain version, cleans prior artifacts, and
-rebuilds with `--locked` to ensure a deterministic output. See comments
-inside `verify-build.sh` for the full list of reproducibility settings.
-
----
-
-## Security Model
-
-Settlement relies on two primitives:
-
-1. **Solver bonds** — solvers lock USDC to participate. Failed fills slash 10% of
-   their bond, making repeated failures unprofitable.
-2. **Fill-window enforcement** — once a solver accepts, the intent is locked for
-   5 minutes. If they fail to fill, the intent reverts to `open` and is
-   re-auctioned, and the bond is slashed permissionlessly via `slash_solver()`.
-
-### Pause scope (issue #36)
-
-`pause()` halts `submit_intent`, `accept_intent`, `fill_intent`, **and** the
-solver bond management functions (`register_solver`, `deregister_solver`,
-`withdraw_bond`). The rationale:
-
-- During a live incident an admin needs to freeze the full protocol state to
-  investigate. Allowing solvers to withdraw bonds while paused would let them
-  shed collateral exactly when the protocol needs it most as a backstop.
-- `slash_solver()` remains **permissionless and unpauseable** — a solver who
-  already accepted an intent cannot dodge accountability by waiting out the
-  pause.
-- `cancel_intent()` remains **open during a pause** — users should always be
-  able to reclaim their Open intents without needing admin cooperation.
-
-### Destination token allowlist default (issue #37)
-
-`is_dst_allowlist_enabled` defaults to **`false`** on a fresh deployment,
-meaning `submit_intent` accepts any `dst_token` address until an admin opts in.
-
-**Pre-launch action required:** before going live on mainnet, call
-`propose_add_dst_token()` for every supported output token, wait out the
-timelock delay (#115), then call `execute_add_dst_token()` followed by
-`set_dst_allowlist_enabled(true)` to enforce validation. This prevents users
-from accidentally targeting an unsupported or malicious token contract, and
-gives them a window to notice the allowlist change before it takes effect.
-Call `list_allowed_dst_tokens()` at any time to see the full current
-allowlist (#117).
-
-The same pattern applies to the **source-chain allowlist** (`is_src_chain_allowlist_enabled`,
-also off by default). Call `add_allowed_src_chain()` for every supported source
-chain (e.g. `"ethereum"`, `"base"`, `"polygon"`), then enable enforcement with
-`set_src_chain_allowlist_enabled(true)`.
-
-To report a vulnerability, see the org
-[SECURITY.md](https://github.com/vortex-protocol/.github/blob/main/SECURITY.md).
-For the detailed threat model specific to `intent_settlement`, see
-[SECURITY.md](./SECURITY.md) in this repository.
-
-**Admin and fee-recipient custody:** See [`docs/custody-transparency.md`](./docs/custody-transparency.md)
-for the current custody model and key holders (updated operationally whenever keys rotate).
-
----
-
-## Intent ID Derivation
-
-Off-chain solver tooling that needs to predict or verify intent IDs can use the
-exact preimage scheme documented here.
-
-**Intent ID is a SHA-256 hash of a collision-resistant preimage.** The preimage
-is built by concatenating (in order):
-
-1. **User Address** — XDR-encoded Stellar account address
-2. **Source Chain** — XDR-encoded string (e.g., `"ethereum"`, `"polygon"`)
-3. **Source Amount** — 8 bytes, big-endian i128 (two's complement signed integer)
-4. **Timestamp** — 8 bytes, big-endian u64 (unsigned integer, seconds since Unix epoch)
-
-**Hash function:** `SHA-256(preimage)` → 32-byte intent ID
-
-This scheme ensures two otherwise-identical intents from different users or chains
-never collide. See [`compute_intent_id()`](./intent_settlement/src/lib.rs#L889)
-for the reference implementation.
-
-### Example (pseudocode)
-
-```python
-import hashlib
-
-def compute_intent_id(user_address: str, src_chain: str, src_amount: int, timestamp: int) -> bytes:
-    preimage = b''
-    preimage += xdr_encode_address(user_address)
-    preimage += xdr_encode_string(src_chain)
-    preimage += src_amount.to_bytes(8, 'big', signed=True)
-    preimage += timestamp.to_bytes(8, 'big', signed=False)
-    return hashlib.sha256(preimage).digest()
-```
-
----
-
-## Roadmap
-
-For a comprehensive, thematic view of the protocol's forward-looking work—cross-chain proof verification, solver reputation infrastructure, community governance, observability, and more—see the public [**ROADMAP.md**](./ROADMAP.md).
-
-That document consolidates scattered follow-up notes and roadmap items from design docs and `SECURITY.md` into a single, community-visible view organized by theme and status (in progress, not started, under research, shipped, out of scope for v1).
-
----
-
-## Contributing
-
-See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for:
-- Rust/Soroban toolchain setup
-- Test conventions and local dev commands  
-- PR checklist and branch-protection requirements
-- Code ownership and review routing
-- Integration test documentation
-
-For **protocol governance** (proposing parameter changes, admin actions, contract
-upgrades), see [`GOVERNANCE.md`](./GOVERNANCE.md). It describes the off-chain
-discussion and deliberation process that precedes the on-chain 48-hour timelock.
-
-For org-wide policies, see the
-[org-wide CONTRIBUTING.md](https://github.com/vortex-protocol/.github/blob/main/CONTRIBUTING.md).
-
-## Ecosystem & Grants
-
-The Vortex ecosystem grows through community-built tooling. We maintain a collection
-of **reference implementations** in this repository (`indexer/reference-indexer.js`,
-`examples/risk_aware_solver_bot.py`) intended as starting points for external contributors.
-
-### Building on Vortex
-
-Interested in building indexers, monitoring dashboards, integration libraries, or solver
-infrastructure? See the [Ecosystem Grants Program](./docs/ecosystem-grants-program.md)
-for how to get funding support once the protocol treasury governance process (issue #117)
-is adopted.
-
-Current ecosystem tooling examples:
-- `indexer/reference-indexer.js` — reference intent indexer (extend to production service)
-- `examples/risk_aware_solver_bot.py` — reference solver bot implementation
-- `solver_registry/` contract — solver reputation and tier management
-
-## License
-
-[MIT](./LICENSE) © 2025–2026 Vortex Protocol Contributors
-
-## Handsoff notes
-
-<!-- handsoff-issue-400 -->
-- #400: [High] Add an interface-version handshake between cooperating contracts
-<!-- handsoff-issue-404 -->
-- #404: [High] Add on-chain rate-of-change guardrails to protocol parameters
+Every `Error` variant that `intent_settlement` can raise is listed below.
+The table is generated from the enum in `intent_settlement/src/lib.rs` by
+[`scripts/generate-error-reference.py`](../scripts/generate-error-reference.py)
+so that it cannot drift from the source.
+
+<!-- BEGIN GENERATED: error-reference -->
+
+This table is **generated** from `intent_settlement/src/lib.rs` by
+[`scripts/generate-error-reference.py`](../scripts/generate-error-reference.py)
+ — run `python3 scripts/generate-error-reference.py --check` to
+verify it is still in sync with the enum.
+
+The `Error` enum declares **127 variants**
+(**95 distinct names**). Every declaration gets its own
+row below, in the order the enum declares them; the `Code` column
+is the on-chain discriminant. The `Condition` column is the
+variant's own rustdoc, so the README and the source cannot
+disagree about what a variant means.
+
+`Raised by` lists the contract entry points that can surface the error —
+including the ones that only reach it through an internal
+helper. It is derived from a call graph of the contract, not from
+a hand-written list. A `—` means the variant is declared but
+never raised anywhere in `intent_settlement/src/lib.rs`.
+
+| # | Variant | Code | Raised by | Condition |
+|---|---------|------|-----------|-----------|
+| 1 | `AlreadyInitialized` | 1 | `initialize` | `initialize` was called on a contract that already has an `Admin` key in instance storage. Raised exclusively by `initialize`. |
+| 2 | `Unauthorized` | 2 | `accept_admin_transfer`, `accept_fee_recipient`, `amend_intent`, `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `cancel_intent`, `dispute_fill`, `execute_upgrade`, `fill_intent`, `get_solver_intents`, `open_dispute`, `pause`, `release_fill`, `request_extension`, `resolve_dispute` | A privileged operation was attempted by a caller who is not the required authority. Raised by `fill_intent` when the caller is not the solver that accepted the intent, and by `cancel_intent` when the caller is not the intent's owner. |
+| 3 | `IntentNotFound` | 3 | `accept_intent`, `accept_intent_with_bond`, `amend_intent`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `bid_intent`, `cancel_intent`, `claim_backstop_compensation`, `close_intent`, `current_min_dst`, `dispute_fill`, `expire_intent`, `fill_intent`, `get_solver_intents`, `open_dispute`, `release_fill`, `request_extension`, `resolve_dispute`, `settle_bids`, `slash_solver` | The supplied `intent_id` has no corresponding `IntentRecord` in persistent storage. Raised by `accept_intent`, `fill_intent`, `cancel_intent`, `slash_solver`, and `expire_intent`. |
+| 4 | `IntentNotOpen` | 4 | `accept_intent`, `accept_intent_with_bond`, `accept_outbound_intent`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `cancel_intent`, `expire_intent`, `fill_intent`, `release_fill`, `resolve_dispute` | The intent's `state` is not `Open` at a point where `Open` is required. Raised by `cancel_intent` (non-`Open`/non-`Accepted` guard) and by `expire_intent` (which only operates on `Open` intents). |
+| 5 | `IntentExpired` | 5 | `accept_intent`, `accept_intent_with_bond`, `accept_outbound_intent`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `fill_intent` | The current ledger timestamp has reached or passed the intent's `deadline` when a solver tries to accept it via `accept_intent`. The intent's state is lazily updated to `Expired` before the panic. |
+| 6 | `IntentNotAccepted` | 6 | `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `claim_backstop_compensation`, `fill_intent`, `get_solver_intents`, `release_fill`, `request_extension`, `resolve_dispute`, `slash_solver` | `fill_intent` or `slash_solver` requires the intent to be in state `Accepted`, but it is in a different terminal or intermediate state. Also raised by `slash_solver` when `intent.state != Accepted`. |
+| 7 | `SolverNotRegistered` | 7 | `accept_intent`, `accept_intent_with_bond`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `deregister_solver`, `fill_intent`, `withdraw_bond`, `withdraw_bond_token` | An operation that requires a registered solver (e.g. `deregister_solver`, `withdraw_bond`, `accept_intent`) was called for an address that has no `SolverRecord` in persistent storage. |
+| 8 | `SolverBondTooLow` | 8 | `accept_intent`, `accept_intent_with_bond`, `accept_outbound_intent`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `fill_intent`, `register_solver`, `register_solver_with_token`, `withdraw_bond`, `withdraw_bond_token` | `register_solver` was called with a `bond_amount` that, when added to any existing bond, does not reach `MIN_BOND` (500_000_000 stroops / 50 USDC). Also raised by `withdraw_bond` when the post-withdrawal balance would fall below `MIN_BOND`. |
+| 9 | `InsufficientOutput` | 9 | `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `fill_intent`, `release_fill`, `resolve_dispute` | `fill_intent` was called with a `fill_amount` less than the intent's `min_dst_amount`. Raised only in `fill_intent`. |
+| 10 | `FillWindowExpired` | 10 | `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `fill_intent`, `get_solver_intents`, `release_fill`, `resolve_dispute`, `slash_solver` | `fill_intent` was called after the intent's `deadline` (i.e. the fill window that starts when the solver calls `accept_intent` and lasts `FILL_WINDOW` seconds) has already elapsed. Also (confusingly) used in `slash_solver` as a guard label when the fill window has *not yet* expired — the intent cannot be slashed before its deadline. |
+| 11 | `CannotCancelAccepted` | 11 | `batch_cancel_intent`, `batch_fill_intent`, `cancel_intent`, `fill_intent` | `cancel_intent` was called on an intent in state `Accepted`. Users may only cancel `Open` intents; once a solver has accepted, the `slash_solver` path must be used if the solver fails to fill. |
+| 12 | `SolverInactive` | 12 | `accept_intent`, `accept_intent_with_bond`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `bid_intent`, `fill_intent`, `release_fill`, `resolve_dispute` | `accept_intent` was called for a solver whose `is_active` flag is `false` (set when the bond falls below `MIN_BOND` after a slash, or after calling `deregister_solver`). |
+| 13 | `ZeroAmount` | 13 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `begin_fill`, `bid_intent`, `fill_intent`, `register_solver`, `register_solver_with_token`, `release_fill`, `rescue_tokens`, `resolve_dispute`, `set_bond_token_min`, `set_min_bond_multiplier`, `submit_intent`, `submit_outbound_intent`, `withdraw_bond`, `withdraw_bond_token` | A numeric input that must be strictly positive was zero or negative. Raised by `submit_intent` (`src_amount` or `min_dst_amount ≤ 0`) and by `register_solver` / `withdraw_bond` (`bond_amount ≤ 0`). |
+| 14 | `InvalidDeadline` | 14 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `fill_intent`, `submit_intent`, `submit_outbound_intent` | `submit_intent` was called with a `deadline` that is already in the past (i.e. `deadline ≤ env.ledger().timestamp()`). |
+| 15 | `IntentAlreadyFilled` | 15 | `batch_cancel_intent`, `batch_fill_intent`, `fill_intent`, `get_solver_intents` | `fill_intent` was called on an intent that is already in state `Filled`. |
+| 16 | `NotInitialized` | 16 | `accept_intent`, `accept_intent_with_bond`, `add_allowed_bond_token`, `add_allowed_src_chain`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `begin_fill`, `cancel_pending_dst_token_add`, `cancel_pending_dst_token_remove`, `claim_backstop_compensation`, `deregister_solver`, `execute_chain_offboarding`, `execute_chain_onboarding`, `execute_set_policy`, `execute_upgrade`, `fill_intent`, `get_arbiter`, `get_bond_token_min`, `get_solver_bond`, `get_solver_bonds`, `get_solver_intents`, `is_allowed_bond_token`, `migrate`, `pause`, `propose_add_dst_token`, `propose_admin_transfer`, `propose_chain_onboarding`, `propose_fee_recipient`, `propose_oracle`, `propose_remove_dst_token`, `propose_set_policy`, `propose_upgrade`, `register_solver`, `register_solver_with_token`, `release_fill`, `remove_allowed_bond_token`, `remove_allowed_src_chain`, `rescue_tokens`, `resolve_dispute`, `set_arbiter`, `set_bid_window_enabled`, `set_bond_token_min`, `set_config`, `set_dst_allowlist_enabled`, `set_intent_retention`, `set_min_bond_multiplier`, `set_pauser`, `set_proof_registry`, `set_src_chain_allowlist_enabled`, `settle_bids`, `slash_solver`, `submit_intent`, `submit_outbound_intent`, `unpause`, `withdraw_bond`, `withdraw_bond_token` | An operation that requires the contract to be initialized (i.e. needs `Admin` in instance storage) was called before `initialize`. Raised by `require_admin` and by `propose_fee_recipient` / `propose_admin_transfer`. |
+| 17 | `SolverHasActiveIntents` | 17 | `deregister_solver`, `withdraw_bond`, `withdraw_bond_token` | `deregister_solver` was called while the solver's `active_intents` counter is greater than zero, meaning at least one intent is currently in state `Accepted` by this solver. The solver must wait for those intents to reach a terminal state first. |
+| 18 | `ContractPaused` | 18 | `accept_intent`, `accept_intent_with_bond`, `batch_accept_intent`, `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `begin_fill`, `bid_intent`, `deregister_solver`, `fill_intent`, `get_solver_intents`, `register_solver`, `register_solver_with_token`, `release_fill`, `resolve_dispute`, `submit_intent`, `submit_intent_signed`, `withdraw_bond`, `withdraw_bond_token` | `submit_intent`, `accept_intent`, or `fill_intent` was called while the contract's `Paused` flag is `true`. Raised by `require_not_paused`. |
+| 19 | `DeadlineNotReached` | 19 | `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `expire_intent`, `fill_intent`, `release_fill`, `resolve_dispute` | `expire_intent` was called before the intent's `deadline` has been reached (i.e. `env.ledger().timestamp() < intent.deadline`). |
+| 20 | `InsufficientBond` | 20 | `withdraw_bond`, `withdraw_bond_token` | `withdraw_bond` was called with an `amount` greater than the solver's current `bond_amount`. |
+| 21 | `DstTokenNotAllowed` | 21 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `fill_intent`, `submit_intent` | `submit_intent` was called with a `dst_token` that is not present in the `AllowedDstToken` allowlist while `DstAllowlistEnabled` is `true`. |
+| 22 | `IntentAlreadyExists` | 22 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `fill_intent`, `submit_intent`, `submit_outbound_intent` | Duplicate `intent_id` detected in `submit_intent` (hash collision guard). |
+| 23 | `FeeOverflow` | 23 | `batch_cancel_intent`, `batch_fill_intent`, `begin_fill`, `fill_intent`, `release_fill`, `resolve_dispute` | #31: fee arithmetic overflowed (fill_amount is astronomically large) |
+| 24 | `InvalidTokenInterface` | 24 | — | #33: the address passed to `propose_add_dst_token` doesn't implement SEP-41 |
+| 25 | `NoPendingFeeRecipient` | 25 | `accept_fee_recipient`, `cancel_pending_fee_recipient` | #30: `accept_fee_recipient` was called with no pending fee-recipient proposal in storage. |
+| 26 | `SrcChainNotAllowed` | 26 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `fill_intent`, `submit_intent` | #34: `submit_intent` was called with a `src_chain` that is not on the allowlist while `SrcChainAllowlistEnabled` is `true`. |
+| 27 | `RescueProtectedToken` | 27 | `rescue_tokens` | #35: `rescue_tokens` was called for the bond token, which the rescue path is not allowed to move. |
+| 28 | `InvalidSrcToken` | 28 | `batch_cancel_intent`, `batch_fill_intent`, `batch_submit_intent`, `fill_intent`, `get_solver_intents`, `submit_intent` | #127: `submit_intent` was called with a `src_token` whose format does not match the conventions of the declared `src_chain`. EVM chains (ethereum, base, polygon, arbitrum, optimism): expect a `0x`-prefixed 42-character hex string (e.g. `"0xA0b86991…"`). Solana: expects a base58 string between 32 and 44 characters long with no `0x` prefix. If `src_chain` is unknown this error is never raised — unknown chains bypass token-format validation so the allowlist remains the sole gate. |
+| 29 | `ProofRegistryNotSet` | 30 | `batch_cancel_intent`, `batch_fill_intent`, `fill_intent`, `get_solver_intents` | docs/129 §2.4 (code 24). `fill_intent` was called with `require_proof = true` but no `DataKey::ProofRegistry` has been set by the admin. Configuration error — no slash, intent stays `Accepted`. |
+| 30 | `ProofNotFound` | 31 | `batch_cancel_intent`, `batch_fill_intent`, `fill_intent`, `get_solver_intents` | docs/129 §2.3 (code 25). `ProofRegistry.get_proof(intent_id)` returned `None`: no verified source-chain deposit for this intent yet. Intent stays `Accepted`; the solver should retry once the VAA is relayed, or be sl

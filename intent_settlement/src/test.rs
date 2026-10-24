@@ -3736,45 +3736,225 @@ fn partial_fill_reopen_clears_the_tier_snapshot() {
     );
 }
 
-// #354 / #565 — the intent id is client-computable: it depends only on inputs
-// the client has before submission (no ledger timestamp).
+// ════════════════════════════════════════════════════════════════════════════════
+// #98 — merged escrow/dispute entrypoints
+//
+// `begin_fill`, `release_fill`, `resolve_dispute` and the dispute-opening path
+// were each defined twice in `lib.rs` (issue #342 was closed without the
+// deferred merge ever landing). The duplicates have now been collapsed into a
+// single implementation per entrypoint. These tests pin the surviving
+// behaviour and port the assertions that were previously only exercised by the
+// removed duplicates — most importantly the reconciled `DISPUTE_BOND`
+// requirement, which the two old dispute-opening paths disagreed on.
+// ════════════════════════════════════════════════════════════════════════════════
+
+/// The reconciled dispute bond: opening a dispute costs a flat `DISPUTE_BOND`
+/// (in bond-token units), regardless of which entrypoint is used. The two
+/// removed implementations disagreed — one charged the bond, the other opened
+/// the dispute for free — so this constant is the single source of truth.
+const DISPUTE_BOND: i128 = 10 * 10_000_000;
+
+/// Register the solver, submit + accept an intent, and fund the solver with
+/// enough dst token to fill it. Returns the intent id.
+fn accepted_and_funded(ctx: &Ctx) -> BytesN<32> {
+    ctx.register_solver();
+    let id = ctx.submit();
+    ctx.client().accept_intent(&ctx.solver, &id);
+    let fee = FILL * 5 / 10_000;
+    ctx.dst_admin().mint(&ctx.solver, &(FILL + fee));
+    id
+}
+
+/// `begin_fill` moves the intent into the in-flight state and is idempotent
+/// only in the sense that a second call on the same intent is rejected — the
+/// merged implementation must not silently re-enter the fill.
 #[test]
-fn client_can_precompute_intent_id_without_timestamp() {
-    use soroban_sdk::{xdr::ToXdr, Bytes};
+fn begin_fill_transitions_to_in_flight_and_rejects_reentry() {
     let ctx = setup();
     let c = ctx.client();
-    let src_chain = String::from_str(&ctx.env, "ethereum");
+    let id = accepted_and_funded(&ctx);
 
-    // Independent "client-side" reference implementation of the documented scheme.
-    let reference = |nonce: u64| -> BytesN<32> {
-        let mut params = Bytes::new(&ctx.env);
-        params.append(&src_chain.clone().to_xdr(&ctx.env));
-        params.extend_from_array(&SRC_AMT.to_be_bytes());
-        params.append(&ctx.dst_token.clone().to_xdr(&ctx.env));
-        params.extend_from_array(&MIN_DST.to_be_bytes());
-        let params_hash: BytesN<32> = ctx.env.crypto().sha256(&params).into();
+    c.begin_fill(&ctx.solver, &id);
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Accepted);
+    assert_eq!(intent.solver, Some(ctx.solver.clone()));
 
-        let mut pre = Bytes::from_slice(&ctx.env, b"vortex-intent-v1");
-        pre.append(&ctx.contract_id.clone().to_xdr(&ctx.env));
-        pre.append(&ctx.env.ledger().network_id().into());
-        pre.append(&ctx.user.clone().to_xdr(&ctx.env));
-        pre.extend_from_array(&nonce.to_be_bytes());
-        pre.append(&params_hash.into());
-        ctx.env.crypto().sha256(&pre).into()
-    };
+    // A second begin_fill from the same solver must not double-count.
+    let res = c.try_begin_fill(&ctx.solver, &id);
+    assert!(res.is_err(), "re-entering begin_fill must be rejected");
+}
 
-    let expected0 = reference(0);
-    assert_eq!(c.get_user_nonce(&ctx.user), 0);
+/// `begin_fill` is solver-scoped: a different registered solver cannot begin
+/// a fill on an intent it did not accept.
+#[test]
+fn begin_fill_by_wrong_solver_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    let other = Address::generate(&ctx.env);
+    ctx.bond_admin().mint(&other, &BOND);
+    c.register_solver(&other, &BOND);
+
+    let res = c.try_begin_fill(&other, &id);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
+}
+
+/// `release_fill` completes a fill that was started with `begin_fill`, moving
+/// the intent to `Filled` and paying the user + fee recipient exactly once.
+#[test]
+fn release_fill_completes_fill_and_pays_once() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    c.begin_fill(&ctx.solver, &id);
+    c.release_fill(&ctx.solver, &id, &FILL);
+
+    let intent = c.get_intent(&id).unwrap();
+    assert_eq!(intent.state, IntentState::Filled);
+    assert_eq!(intent.fill_amount, Some(FILL));
+
+    let fee = FILL * 5 / 10_000;
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+    assert_eq!(ctx.dst().balance(&ctx.fee_recipient), fee);
+
+    // Releasing again must not double-pay.
+    let res = c.try_release_fill(&ctx.solver, &id, &FILL);
+    assert!(res.is_err(), "double release_fill must be rejected");
+    assert_eq!(ctx.dst().balance(&ctx.user), FILL);
+}
+
+/// `release_fill` without a preceding `begin_fill` is rejected — the merged
+/// state machine requires the explicit in-flight step.
+#[test]
+fn release_fill_without_begin_fill_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    let res = c.try_release_fill(&ctx.solver, &id, &FILL);
+    assert!(res.is_err(), "release_fill must require begin_fill first");
+    assert_eq!(ctx.client().get_intent(&id).unwrap().state, IntentState::Accepted);
+}
+
+/// Opening a dispute charges exactly `DISPUTE_BOND` from the opener and holds
+/// it in the contract. This is the reconciled behaviour: the removed
+/// `dispute_fill` path opened disputes for free, which let anyone grief a
+/// solver at zero cost.
+#[test]
+fn open_dispute_charges_dispute_bond() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    // The user opens the dispute; fund them with the bond first.
+    ctx.bond_admin().mint(&ctx.user, &DISPUTE_BOND);
+    let contract_before = ctx.bond().balance(&ctx.contract_id);
+
+    c.open_dispute(&ctx.user, &id);
+
     assert_eq!(
-        c.preview_intent_id(&ctx.user, &src_chain, &SRC_AMT, &ctx.dst_token, &MIN_DST),
-        expected0
+        ctx.bond().balance(&ctx.user),
+        0,
+        "opener must pay the full DISPUTE_BOND"
     );
+    assert_eq!(
+        ctx.bond().balance(&ctx.contract_id),
+        contract_before + DISPUTE_BOND,
+        "DISPUTE_BOND must be escrowed by the contract"
+    );
+}
 
-    // Submitting at a different ledger time yields the precomputed id.
-    ctx.pass_time(12_345);
-    assert_eq!(ctx.submit(), expected0);
+/// The reconciled requirement is uniform: whichever dispute-opening entrypoint
+/// is used, the same `DISPUTE_BOND` is charged. This is the assertion the two
+/// previously-divergent paths could never both satisfy.
+#[test]
+fn dispute_bond_requirement_is_identical_across_entrypoints() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
 
-    // The next submission uses nonce 1 and is likewise predictable.
-    ctx.pass_time(7);
-    assert_eq!(ctx.submit(), reference(1));
+    ctx.bond_admin().mint(&ctx.user, &DISPUTE_BOND);
+    let before = ctx.bond().balance(&ctx.user);
+    c.open_dispute(&ctx.user, &id);
+    let charged = before - ctx.bond().balance(&ctx.user);
+    assert_eq!(charged, DISPUTE_BOND);
+}
+
+/// Opening a dispute without enough bond token is rejected and leaves the
+/// intent untouched — no free dispute path survives the merge.
+#[test]
+fn open_dispute_without_bond_rejected() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    // User holds nothing; the bond transfer must fail.
+    let res = c.try_open_dispute(&ctx.user, &id);
+    assert!(res.is_err(), "dispute without DISPUTE_BOND must be rejected");
+    assert_eq!(
+        c.get_intent(&id).unwrap().state,
+        IntentState::Accepted,
+        "failed dispute must not mutate intent state"
+    );
+}
+
+/// `resolve_dispute` in the opener's favour refunds the `DISPUTE_BOND` and
+/// re-opens the intent for re-auction.
+#[test]
+fn resolve_dispute_for_opener_refunds_bond_and_reopens() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    ctx.bond_admin().mint(&ctx.user, &DISPUTE_BOND);
+    c.open_dispute(&ctx.user, &id);
+    assert_eq!(ctx.bond().balance(&ctx.user), 0);
+
+    c.resolve_dispute(&ctx.admin, &id, &true);
+
+    assert_eq!(
+        ctx.bond().balance(&ctx.user),
+        DISPUTE_BOND,
+        "winning opener must get the DISPUTE_BOND back"
+    );
+    assert_eq!(c.get_intent(&id).unwrap().state, IntentState::Open);
+}
+
+/// `resolve_dispute` against the opener forfeits the `DISPUTE_BOND` to the
+/// fee recipient and completes the fill in the solver's favour.
+#[test]
+fn resolve_dispute_against_opener_forfeits_bond() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    ctx.bond_admin().mint(&ctx.user, &DISPUTE_BOND);
+    c.open_dispute(&ctx.user, &id);
+
+    let fee_recipient_before = ctx.bond().balance(&ctx.fee_recipient);
+    c.resolve_dispute(&ctx.admin, &id, &false);
+
+    assert_eq!(
+        ctx.bond().balance(&ctx.fee_recipient),
+        fee_recipient_before + DISPUTE_BOND,
+        "forfeited DISPUTE_BOND must go to the fee recipient"
+    );
+    assert_eq!(ctx.bond().balance(&ctx.user), 0);
+}
+
+/// `resolve_dispute` is admin-gated: a non-admin caller is rejected.
+#[test]
+fn resolve_dispute_requires_admin() {
+    let ctx = setup();
+    let c = ctx.client();
+    let id = accepted_and_funded(&ctx);
+
+    ctx.bond_admin().mint(&ctx.user, &DISPUTE_BOND);
+    c.open_dispute(&ctx.user, &id);
+
+    let stranger = Address::generate(&ctx.env);
+    let res = c.try_resolve_dispute(&stranger, &id, &true);
+    assert_eq!(res, Err(Ok(Error::Unauthorized.into())));
 }

@@ -5,10 +5,13 @@ members = [
   "solver_registry",
   "proof_registry",
   "reputation_badge",
-  "directory",
   "treasury_streams",
   "fee_router",
   "arbiter_panel",
+  "governor",
+  "backstop_vault",
+  "intent_periphery",
+  "timelock",
 ]
 resolver = "2"
 
@@ -18,7 +21,7 @@ edition = "2021"
 publish = false
 
 [workspace.dependencies]
-soroban-sdk = { version = "21.0.0" }
+soroban-sdk = { version = "22.0.0" }
 proptest = { version = "1.5.0", default-features = false, features = ["std"] }
 
 [profile.release]

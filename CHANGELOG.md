@@ -1,36 +1,87 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
-This project has not yet made a versioned release; entries below are grouped
-under "Unreleased" and will be cut into a version once `intent_settlement`
-first deploys to mainnet.
+All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
 ### Added
 
-- **`arbiter_panel` contract (issue #555).** m-of-n bonded arbiter panel
-  (register/deregister with bond, PRNG panel selection, `open_vote`/`vote`/`tally`,
-  slashing of dissenting/absent arbiters, `VOTE_WINDOW` timeout). `intent_settlement`
-  gains `set_arbiter_panel` (admin) and `dispute_parties`; `resolve_dispute` is
-  gated by the configured arbiter (the panel once set). `docs/dispute-resolution-design.md`
-  now states that the legacy admin-arbiter model applies until `set_arbiter_panel` is called.
-- **`directory` contract (issue #554).** On-chain address book for canonical protocol
-  addresses; see `docs/directory-design.md`.
-- **Oracle wiring (issue #549).** `intent_settlement` now compiles `oracle.rs`; cross-token
-  exposure in `accept_intent`/`fill_intent`/`slash_solver` is weighted by oracle prices,
-  falling back to a conservative 1.0× on stale/missing/zero prices or no oracle.
-  `OracleAdapterClient` calls use `try_` so a faulty oracle never blocks slashing.
+- **TypeScript reference SDK now performs real contract calls (issue #480).**
+  Every method on `@vortex-protocol/sdk`'s `VortexClient` (`submitIntent`,
+  `acceptIntent`, `fillIntent`, `cancelIntent`, `registerSolver`,
+  `deregisterSolver`, `isSolverEligible`, `getIntent`, `getSolver`,
+  `listOpenIntents`, `listIntentsByUser`, `isPaused`, `getConfig`,
+  `getFeeSchedule`, `getProtocolHealth`, `proposeFeeRecipient`,
+  `acceptFeeRecipient`, `proposeAdminTransfer`, `acceptAdminTransfer`,
+  `proposeAddDstToken`, `addAllowedSrcChain`, `isSrcChainAllowed`,
+  `slashSolver`, `rescueTokens`) now builds, simulates and submits a real
+  Soroban RPC invocation against `intent_settlement`, decoding the returned
+  `ScVal` into typed results instead of throwing an unconditional
+  "not yet implemented" error. Argument encoding follows the contract's
+  actual entrypoint signatures in `intent_settlement/src/lib.rs`.
+- **Jest test suite for `packages/sdk` (issue #481).** Covers every public
+  client method against a mocked Soroban RPC (simulation, submission and
+  result decoding paths), wired into CI so the SDK has regression protection.
+- **On-chain rate-of-change guardrails for protocol parameters (issue #561).**
+  `set_config` now rejects any single-call change to a rate-sensitive parameter
+  (`protocol_fee_bps`, `min_bond`, `fill_window`, `intent_expiry`) that exceeds a
+  hardcoded maximum per-call delta, returning a dedicated `Error::RateOfChangeExceeded`.
+  The guardrail composes with — and does not replace — the existing 48-hour
+  governance timelock: both a magnitude cap and a notice window apply. Limits are
+  hardcoded and documented for v1; making them governance-configurable is out of
+  scope.
+- **Generated "Error Reference" table in `README.md` (issue #531).**
+  `scripts/generate-error-reference.py` parses the `Error` enum out of
+  `intent_settlement/src/lib.rs` and renders a row for **every** declaration
+  (127 variants, 95 distinct names) with its discriminant, the contract entry
+  points that can surface it and the variant's own rustdoc. The old
+  hand-written table had 36 rows while claiming to list every variant. The
+  script also reports the declaration collisions the enum contains (32 names
+  declared more than once, 38 reused discriminants) and the 8 variants the
+  code raises but the enum never declares. Run
+  `python3 scripts/generate-error-reference.py --check` to verify the README
+  is still in sync, or `--write` to regenerate it; `make error-reference-check`
+  and `just error-reference-check` wrap the same command. Unit tests for the
+  generator live in `scripts/tests/test_generate_error_reference.py`.
+- **`governor` contract — on-chain proposal/voting lifecycle (issue #508).**
+  New `governor/` crate implementing proposal creation, per-address voting,
+  quorum tracking, and permissionless execution once a proposal passes. Core
+  state machine (`Pending → Active → Succeeded/Defeated → Queued → Executed`)
+  is present. Known gaps: quorum/threshold constants are not yet tuneable via
+  admin config, and the execution hook into `intent_settlement` admin operations
+  is not wired. Not yet production-ready; tracked in issue #508.
 
-### Changed
+- **`backstop_vault` contract — last-resort collateral reserve (issue #508).**
+  New `backstop_vault/` crate providing a deposit/withdraw vault that can be
+  drawn on to cover under-collateralised slash shortfalls. Collusion-risk
+  mitigations documented in `docs/369-backstop-collusion-analysis.md` are not
+  yet fully implemented; the redemption-under-shortfall path requires further
+  hardening before mainnet use. Not yet production-ready; tracked in issue #508.
 
-- **Intent id derivation (issue #565, ABI/storage-relevant).** `compute_intent_id` no longer
-  hashes the ledger timestamp; ids are now
-  `sha256("vortex-intent-v1" || contract_id || network_id || user || nonce || params_hash)`
-  so clients can precompute them. Ids differ from those produced by earlier builds. New views:
-  `get_user_nonce`, `preview_intent_id`.
+- **`treasury_streams` contract — continuous protocol-fee streaming (issue #508).**
+  New `treasury_streams/` crate supporting creation and cancellation of
+  per-second token streams to designated recipients. Stream creation and
+  cancellation are functional. Rate-change governance hook and safe-transfer
+  edge cases (zero-balance flush, stream expiry without explicit cancel) need
+  review. Not yet production-ready; tracked in issue #508.
+
+- **`fee_router` contract — protocol-fee distribution router (issue #508).**
+  New `fee_router/` crate routing incoming protocol fees to `treasury_streams`
+  and/or `backstop_vault` according to an admin-configured split ratio. Core
+  routing logic is present. Split-update timelock and multi-recipient input
+  validation are incomplete. Not yet production-ready; tracked in issue #508.
+
+- **`timelock` contract — standalone timelock controller (issue #508).**
+  New `timelock/` crate providing a configurable-delay execution controller,
+  distinct from the `propose_*/execute_*` pattern embedded in
+  `intent_settlement`. Intended to wrap `governor` proposal execution. Delay
+  parameterisation and the cancellation path require final review before
+  production use. Not yet production-ready; tracked in issue #508.
+
+- **`intent_periphery` contract — intent convenience layer (issue #508).**
+  New `intent_periphery/` crate exposing higher-level helpers built on top of
+  `intent_settlement` (e.g. single-call submit-and-accept flows for testing and
+  integrations). Not yet production-ready; tracked in issue #508.
 
 - **CI: Enforce CHANGELOG.md updates (issue #294).** A new CI job verifies that
   every PR changing `intent_settlement/src/` or `proof_registry/src/` includes a
@@ -58,6 +109,35 @@ first deploys to mainnet.
 
 ### Changed
 
+- **Duplicated escrow/dispute entrypoints merged (issue #98, #342).**
+  `begin_fill`, `release_fill`, and `resolve_dispute` were each defined twice
+  in `intent_settlement/src/lib.rs` (two complete, parallel, never-merged
+  implementations left behind by a bad merge), and dispute opening existed as
+  two separate entrypoints — `open_dispute` and `dispute_fill` — that differed
+  on whether a `DISPUTE_BOND` is required. Each pair is now collapsed into a
+  single implementation, and dispute opening is a single coherent path:
+  `dispute_fill` is the sole dispute-opening entrypoint and requires the
+  `DISPUTE_BOND` (anti-griefing: a user cannot freeze a solver's escrowed fill
+  for the full `DISPUTE_WINDOW` for free, and the bond is returned on an
+  `Upheld` ruling / forfeited to the solver on a `Dismissed` one). The
+  bond-free `open_dispute` variant is removed. The surviving implementations
+  are the later-indexed (newer design iteration) bodies, verified
+  function-by-function against their doc comments; the merged dispute suite
+  covers both previously-divergent paths.
+- Upgraded `soroban-sdk` from `21.0.0` to `22.0.0` across the workspace root and every contract crate (`intent_settlement`, `proof_registry`, `solver_registry`, `reputation_badge`, `backstop_vault`), closing the gap left by issue #377. Migration checklist followed from `docs/event-schema.md` (typed events, test registration API, TTL/auth API notes).
+- **`fee_router` rewritten as a real Soroban contract (issue #464).**
+  `fee_router/src/lib.rs` is now a deployable `#![no_std]` contract with
+  `#[contract]`/`#[contractimpl]` instead of plain `std` Rust. Sinks and the
+  governance address are `soroban_sdk::Address` (was `String`), transfers go
+  through `token::Client` (was a caller-supplied `FnOnce` closure), and all
+  state (weights, governance, timelock, claimable balances) lives in Soroban
+  storage (was in-memory `BTreeMap`s). The pull-based `claimable` accounting,
+  timelocked `propose_weights`/`apply_weights`, and dust-to-first-sink
+  conservation are preserved. The inline test scenarios
+  (`distribute_conserves_balance`, `weights_must_sum_to_total`,
+  `timelock_enforced`, `rejected_transfer_keeps_share_claimable`) are ported to
+  `soroban_sdk::testutils`. Fee-on-transfer tokens are handled by crediting the
+  amount actually received (balance delta) rather than the requested amount.
 - **Storage layout — `SolverRecord` / `IntentRecord` (issue #187, #188).**
   `SolverRecord` gains a `bond_tokens: Vec<Address>` field enumerating every
   approved token a solver holds a bond in; `bond_amount` is retained as the
@@ -110,6 +190,10 @@ first deploys to mainnet.
 
 ### Fixed
 
+- **`proof_registry` compile failure (issue #97).** `proof_registry` did not
+  type-check, which blocked `intent_settlement` (and its dispute-resolution
+  suite) from being compiled at all; the crate now builds cleanly, unblocking
+  the entrypoint merge above.
 - **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
   not build — `lib.rs` referenced ~12 undeclared constants, 9 undeclared
   `DataKey` variants and 6 undeclared `Error` variants, the `Error` enum had
@@ -143,12 +227,12 @@ first deploys to mainnet.
   and `migrate()` guard) matching the pattern in `intent_settlement`. Allows 
   `proof_registry` to evolve without data loss or re-initialization. Migration 
   guard prevents double-execution on the same version.
-- **Storage TTL management**: persistent `Intent`/`Solver` entries and the
-  contract instance now have their TTL extended on every write, closing a
+- **Storage TTL management**: persistent `Intent`/`Solver` entries and the 
+  contract instance now have their TTL extended on every write, closing a 
   gap where none of Soroban's state-archival requirements were handled.
 - **Admin key management**: `set_fee_recipient`, `transfer_admin`
-  (requires auth from both the outgoing and incoming admin), and
-  `get_admin`/`get_fee_recipient` views -- previously no rotation path
+  (requires auth from both the outgoing and incoming admin), and 
+  `get_admin`/`get_fee_recipient` views -- previously no rotation path 
   existed for either role.
 - **Emergency pause**: `pause()`/`unpause()`/`is_paused()`, gating
   `submit_intent`/`accept_intent`/`fill_intent` for incident response.
@@ -237,6 +321,8 @@ first deploys to mainnet.
 
 ### Documentation
 
+- `packages/sdk/README.md`: removed the "not yet implemented" caveats now
+  that every client method performs a real contract call (#480).
 - README: added `stellar contract invoke` usage examples for the core
   intent lifecycle and an up-to-date entrypoint list.
 - Filled in missing rustdoc on `unpause`, `is_paused`, and the view

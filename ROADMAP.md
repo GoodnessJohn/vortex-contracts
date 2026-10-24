@@ -1,6 +1,6 @@
 # Vortex Protocol Public Roadmap
 
-**Last updated:** 2026-09-24
+**Last updated:** 2026-10-22
 
 This document consolidates forward-looking work, deferred features, and known limitations scattered across `SECURITY.md`, design docs, and the README into a single, community-visible roadmap. It is a **thematic, high-level view** of what the team considers important future work, organized by category and current status.
 
@@ -19,7 +19,7 @@ This document consolidates forward-looking work, deferred features, and known li
 
 | Item | Status | Details | Issue(s) |
 |------|--------|---------|----------|
-| Proof Registry contract & interface | 🎯 Not Started | Contract to store and serve verified Wormhole VAAs; on-chain reference for `fill_intent(require_proof=true)` | #190, #124 |
+| Proof Registry contract & interface | ✅ Shipped | `proof_registry` crate stores and serves verified Wormhole VAAs; on-chain reference for `fill_intent(require_proof=true)` | #190, #124 |
 | Proof verification integration with `fill_intent` | 🔄 In Progress | Optional on-chain gate: `fill_intent(..., require_proof=true)` checks the `ProofRegistry` before allowing a fill | #190 |
 | Proof mismatch fallback & recovery | 🔄 In Progress | Handling for edge cases: proof arrives late, is invalid, or conflicts with a fill | #129 |
 | Cross-chain oracle pricing (cross-token value comparison) | 🔍 Under Research | Currently slash amounts assume same-token or admin-set minimums; a price oracle would enable true cross-token comparisons | SECURITY.md, #193 |
@@ -37,7 +37,7 @@ This document consolidates forward-looking work, deferred features, and known li
 |------|--------|---------|----------|
 | Solver Registry contract & enumerable list | ✅ Shipped | On-chain registry with paginated `list_solvers(start, limit)` for real-time solver discovery | #13, #197 |
 | Solver reputation score computation | ✅ Shipped | `compute_reputation_score` based on fills completed, fills failed, and total volume | #41, #197 |
-| Reputation-tier badge (on-chain, score-derived) | 🎯 Not Started | NFT-style on-chain tier display (Unranked / Bronze / Silver / Gold / Platinum) based on reputation score | #57 |
+| Reputation-tier badge (on-chain, score-derived) | ✅ Shipped | `reputation_badge` crate: NFT-style on-chain tier display (Unranked / Bronze / Silver / Gold / Platinum) based on reputation score | #57, #242, #396, #397 |
 | Leaderboard & ranking tool (off-chain) | 🎯 Not Started | Public tool for sorting solvers by reputation, volume, and other signals; feeds tier-badge data | #41 |
 | Governance-weight formula | 🎯 Not Started | Define "reputation × bond" or similar weighting for community signaling; used by reputation-weighted governance tool | #41, #305 |
 | Off-chain reputation-weighted signaling tool | 🎯 Not Started | Tool for signed off-chain messages expressing community preference on governance proposals, weighted by governance-weight formula | #305 |
@@ -62,6 +62,30 @@ This document consolidates forward-looking work, deferred features, and known li
 | Arbiter election & dispute resolution (future) | 🚫 Out of Scope (v1) | Reputation-weighted jury for user-solver disputes; deferred pending solver reputation stabilization | docs/dispute-resolution-design.md |
 
 **Coordination:** Issues #112, #302 establish the governance processes. Issue #37 builds the on-chain treasury contract. See `docs/114-multisig-admin-design.md`, `docs/treasury-spending-governance.md`.
+
+---
+
+## 3a. New Contract Wave — Governor, Backstop Vault, Treasury Streams, Fee Router & Timelock
+
+**Goal:** Ship a full governance and treasury stack — on-chain proposal/voting, a collateral backstop, streaming treasury disbursements, protocol fee routing, and a standalone timelock controller — to underpin the community-governance vision in section 3.
+
+> **Status note:** All five contracts exist in the codebase today but are **not yet production-ready**. Each carries known functional gaps tracked in issues #508-#511 and the companion issues in that batch. Use the ⚠️ marker below for items that are merged but not deployable without further work.
+
+**Status legend addition:**
+- ⚠️ **Shipped (not production-ready):** Code merged; known gaps remain before mainnet use.
+
+| Item | Status | Details | Issue(s) |
+|------|--------|---------|----------|
+| **Governor** contract | ⚠️ Shipped (not production-ready) | On-chain proposal creation, voting, and execution flow. Core lifecycle present; quorum/threshold logic and integration with `intent_settlement` admin operations require hardening before production use. | #508 |
+| **Backstop Vault** contract | ⚠️ Shipped (not production-ready) | Collateral reserve vault providing a last-resort backstop for under-collateralised slashes. Deposit/withdraw mechanics present; redemption-under-shortfall path and collusion-risk mitigations (see `docs/369-backstop-collusion-analysis.md`) not yet complete. | #508, #369 |
+| **Treasury Streams** contract | ⚠️ Shipped (not production-ready) | Continuous streaming of protocol fees to designated recipients. Stream creation and cancellation implemented; rate-change governance hook and safe-transfer edge cases need review. | #508 |
+| **Fee Router** contract | ⚠️ Shipped (not production-ready) | Routes incoming protocol fees to Treasury Streams and/or the Backstop Vault according to an admin-configured split. Routing logic present; split-update timelock and multi-recipient validation incomplete. | #508 |
+| **Timelock** (standalone) contract | ⚠️ Shipped (not production-ready) | Standalone timelock controller (separate from the `propose_*/execute_*` pattern already embedded in `intent_settlement`). Intended to wrap Governor execution with a configurable delay. Delay parameterisation and cancellation path require final review. | #508 |
+| Governor × Timelock integration | 🔄 In Progress | Wire Governor proposal execution through the standalone Timelock; align delay with the 14-day convention used elsewhere. | #508 |
+| Backstop Vault × Fee Router integration | 🔄 In Progress | Automated top-up path: Fee Router directs a configurable percentage of protocol fees into the Backstop Vault reserve. | #508, #369 |
+| Production-readiness audit (all five contracts) | 🎯 Not Started | Focused audit covering quorum logic, streaming arithmetic overflow, fee-split invariants, and timelock bypass vectors before any mainnet deployment. | #508 |
+
+**Coordination:** This block of work is tracked collectively under issue #508 with per-contract sub-issues. See `docs/369-backstop-collusion-analysis.md` for the backstop risk analysis. The standalone Timelock is intentionally distinct from the timelock already embedded in `intent_settlement`; both must remain in sync on delay values.
 
 ---
 

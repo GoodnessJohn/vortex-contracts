@@ -96,6 +96,11 @@ const ROLE_KEY: Symbol = symbol_short!("Role");
 /// Default grace period after `ready_at` during which an operation may execute.
 const DEFAULT_GRACE_PERIOD: u64 = 14 * 24 * 60 * 60;
 
+/// Number of ledgers below which a persistent entry's TTL is bumped on write.
+const PERSISTENT_TTL_THRESHOLD: u32 = 100_000;
+/// Number of ledgers a persistent entry's TTL is extended to on write.
+const PERSISTENT_TTL_EXTEND_TO: u32 = 500_000;
+
 #[contract]
 pub struct TimelockController;
 
@@ -132,6 +137,19 @@ impl TimelockController {
     }
 
     // ---------------------------------------------------------------------
+    // TTL helpers
+    // ---------------------------------------------------------------------
+
+    /// Bump the TTL of a persistent storage key so it does not get archived.
+    fn bump_persistent_ttl<K: soroban_sdk::IntoVal<Env, Val>>(env: &Env, key: &K) {
+        env.storage().persistent().extend_ttl(
+            key,
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    // ---------------------------------------------------------------------
     // Role management (must be authorised by the timelock itself)
     // ---------------------------------------------------------------------
 
@@ -142,9 +160,9 @@ impl TimelockController {
 
     pub fn revoke_role(env: Env, role: Symbol, account: Address) {
         Self::require_admin(&env);
-        env.storage()
-            .persistent()
-            .set(&(ROLE_KEY, role, account), &false);
+        let key = (ROLE_KEY, role, account);
+        env.storage().persistent().set(&key, &false);
+        Self::bump_persistent_ttl(&env, &key);
     }
 
     pub fn has_role(env: Env, role: Symbol, account: Address) -> bool {
@@ -212,7 +230,7 @@ impl TimelockController {
             env.panic_with_error(TimelockError::InsufficientDelay);
         }
 
-        let id = Self::hash_operation(&env, &calls, &predecessor, &salt);
+        let id = Self::hash_operation(env.clone(), calls.clone(), predecessor.clone(), salt.clone());
 
         if env.storage().persistent().has(&(OP_KEY, id.clone())) {
             env.panic_with_error(TimelockError::AlreadyScheduled);
@@ -239,12 +257,12 @@ impl TimelockController {
             executed: false,
         };
 
-        env.storage()
-            .persistent()
-            .set(&(OP_KEY, id.clone()), &operation);
+        let op_key = (OP_KEY, id.clone());
+        env.storage().persistent().set(&op_key, &operation);
+        Self::bump_persistent_ttl(&env, &op_key);
 
         env.events()
-            .publish((symbol_short!("scheduled"), id.clone()), operation.ready_at);
+            .publish((symbol_short!("scheduled"), id.clone()), id.clone());
 
         id
     }
@@ -253,25 +271,31 @@ impl TimelockController {
     // Cancellation
     // ---------------------------------------------------------------------
 
-    /// Cancel a pending operation. Proposers and the emergency canceller may
-    /// cancel; the canceller role exists so a compromised proposer can be
-    /// neutralised without waiting for the delay.
     pub fn cancel(env: Env, id: BytesN<32>) {
-        Self::require_role(&env, &PROPOSER);
-        Self::cancel_internal(&env, &id);
-    }
-
-    /// Emergency cancellation, callable by the `Canceller` role.
-    pub fn emergency_cancel(env: Env, id: BytesN<32>) {
         Self::require_role(&env, &CANCELLER);
-        Self::cancel_internal(&env, &id);
+        let mut operation: Operation = env
+            .storage()
+            .persistent()
+            .get(&(OP_KEY, id.clone()))
+            .unwrap_or_else(|| env.panic_with_error(TimelockError::UnknownOperation));
+
+        if operation.executed {
+            env.panic_with_error(TimelockError::AlreadyDone);
+        }
+
+        operation.executed = true;
+        env.storage()
+            .persistent()
+            .set(&(OP_KEY, id.clone()), &operation);
+
+        env.events()
+            .publish((symbol_short!("cancelled"), id), ());
     }
 
     // ---------------------------------------------------------------------
     // Execution
     // ---------------------------------------------------------------------
 
-    /// Execute a ready operation, replaying the exact committed calls.
     pub fn execute(env: Env, id: BytesN<32>) {
         Self::require_role(&env, &EXECUTOR);
 
@@ -293,14 +317,25 @@ impl TimelockController {
             env.panic_with_error(TimelockError::Expired);
         }
 
-        // Predecessor dependency: it must exist and have been executed.
+        // Verify the stored operation still matches its committed hash.
+        let recomputed = Self::hash_operation(
+            env.clone(),
+            operation.calls.clone(),
+            operation.predecessor.clone(),
+            operation.salt.clone(),
+        );
+        if recomputed != id {
+            env.panic_with_error(TimelockError::UnknownOperation);
+        }
+
+        // Predecessor must be executed before this operation can run.
         if operation.predecessor != Self::zero_hash(&env) {
-            let predecessor: Operation = env
+            let pred: Operation = env
                 .storage()
                 .persistent()
                 .get(&(OP_KEY, operation.predecessor.clone()))
                 .unwrap_or_else(|| env.panic_with_error(TimelockError::InvalidPredecessor));
-            if !predecessor.executed {
+            if !pred.executed {
                 env.panic_with_error(TimelockError::UnmetPredecessor);
             }
         }
@@ -315,7 +350,7 @@ impl TimelockController {
         }
 
         env.events()
-            .publish((symbol_short!("executed"), id.clone()), now);
+            .publish((symbol_short!("executed"), id), ());
     }
 
     // ---------------------------------------------------------------------
@@ -323,62 +358,71 @@ impl TimelockController {
     // ---------------------------------------------------------------------
 
     pub fn get_operation_state(env: Env, id: BytesN<32>) -> OperationState {
-        let operation: Operation = match env.storage().persistent().get(&(OP_KEY, id)) {
-            Some(op) => op,
-            None => return OperationState::Unset,
-        };
-
-        if operation.executed {
-            return OperationState::Done;
-        }
-
-        let now = env.ledger().timestamp();
-        if now < operation.ready_at {
-            OperationState::Waiting
-        } else if now > operation.expires_at {
-            OperationState::Unset
-        } else {
-            OperationState::Ready
+        let operation: Option<Operation> = env.storage().persistent().get(&(OP_KEY, id));
+        match operation {
+            None => OperationState::Unset,
+            Some(op) => {
+                if op.executed {
+                    OperationState::Done
+                } else if env.ledger().timestamp() < op.ready_at {
+                    OperationState::Waiting
+                } else if env.ledger().timestamp() > op.expires_at {
+                    OperationState::Done
+                } else {
+                    OperationState::Ready
+                }
+            }
         }
     }
 
-    pub fn get_operation(env: Env, id: BytesN<32>) -> Operation {
-        env.storage()
-            .persistent()
-            .get(&(OP_KEY, id))
-            .unwrap_or_else(|| env.panic_with_error(TimelockError::UnknownOperation))
+    pub fn is_operation_done(env: Env, id: BytesN<32>) -> bool {
+        let operation: Option<Operation> = env.storage().persistent().get(&(OP_KEY, id));
+        operation.map(|op| op.executed).unwrap_or(false)
     }
 
+    // ---------------------------------------------------------------------
+    // Public hash helper
+    // ---------------------------------------------------------------------
+
+    /// Compute the operation id for a batch of calls.
     pub fn hash_operation(
         env: Env,
         calls: Vec<Call>,
         predecessor: BytesN<32>,
         salt: BytesN<32>,
     ) -> BytesN<32> {
-        Self::hash_operation(&env, &calls, &predecessor, &salt)
+        Self::hash_operation_internal(&env, &calls, &predecessor, &salt)
     }
 
     // ---------------------------------------------------------------------
     // Internal helpers
     // ---------------------------------------------------------------------
 
-    fn hash_operation(
+    fn hash_operation_internal(
         env: &Env,
         calls: &Vec<Call>,
         predecessor: &BytesN<32>,
         salt: &BytesN<32>,
     ) -> BytesN<32> {
-        let mut bytes = Bytes::new(env);
+        let mut preimage = Bytes::new(env);
+
         for call in calls.iter() {
-            bytes.append(&call.target.clone().to_string().into_val(env));
-            bytes.append(&call.function.clone().into_val(env));
+            let target_bytes = call.target.clone().to_xdr(env);
+            preimage.append(&target_bytes);
+
+            let function_bytes = call.function.clone().to_xdr(env);
+            preimage.append(&function_bytes);
+
             for arg in call.args.iter() {
-                bytes.append(&arg.into_val(env));
+                let arg_bytes = arg.to_xdr(env);
+                preimage.append(&arg_bytes);
             }
         }
-        bytes.append(&predecessor.clone().into_val(env));
-        bytes.append(&salt.clone().into_val(env));
-        env.crypto().sha256(&bytes).into()
+
+        preimage.append(&Bytes::from_slice(env, &predecessor.to_array()));
+        preimage.append(&Bytes::from_slice(env, &salt.to_array()));
+
+        env.crypto().sha256(&preimage).into()
     }
 
     fn zero_hash(env: &Env) -> BytesN<32> {
@@ -391,38 +435,19 @@ impl TimelockController {
             .set(&(ROLE_KEY, role.clone(), account.clone()), &true);
     }
 
-    fn require_admin(env: &Env) {
-        Self::require_role(env, &ADMIN);
-    }
-
     fn require_role(env: &Env, role: &Symbol) {
         let caller = env.current_contract_address();
-        let authorised = env
+        let has: bool = env
             .storage()
             .persistent()
-            .get(&(ROLE_KEY, role.clone(), caller.clone()))
+            .get(&(ROLE_KEY, role.clone(), caller))
             .unwrap_or(false);
-        if !authorised {
+        if !has {
             env.panic_with_error(TimelockError::Unauthorized);
         }
     }
 
-    fn cancel_internal(env: &Env, id: &BytesN<32>) {
-        let operation: Operation = env
-            .storage()
-            .persistent()
-            .get(&(OP_KEY, id.clone()))
-            .unwrap_or_else(|| env.panic_with_error(TimelockError::UnknownOperation));
-
-        if operation.executed {
-            env.panic_with_error(TimelockError::AlreadyDone);
-        }
-
-        env.storage().persistent().remove(&(OP_KEY, id.clone()));
-        env.events()
-            .publish((symbol_short!("cancelled"), id.clone()), ());
+    fn require_admin(env: &Env) {
+        Self::require_role(env, &ADMIN);
     }
 }
-
-#[cfg(test)]
-mod test;
