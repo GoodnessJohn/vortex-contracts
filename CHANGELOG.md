@@ -6,6 +6,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **TypeScript reference SDK now performs real contract calls (issue #480).**
+  Every method on `@vortex-protocol/sdk`'s `VortexClient` (`submitIntent`,
+  `acceptIntent`, `fillIntent`, `cancelIntent`, `registerSolver`,
+  `deregisterSolver`, `isSolverEligible`, `getIntent`, `getSolver`,
+  `listOpenIntents`, `listIntentsByUser`, `isPaused`, `getConfig`,
+  `getFeeSchedule`, `getProtocolHealth`, `proposeFeeRecipient`,
+  `acceptFeeRecipient`, `proposeAdminTransfer`, `acceptAdminTransfer`,
+  `proposeAddDstToken`, `addAllowedSrcChain`, `isSrcChainAllowed`,
+  `slashSolver`, `rescueTokens`) now builds, simulates and submits a real
+  Soroban RPC invocation against `intent_settlement`, decoding the returned
+  `ScVal` into typed results instead of throwing an unconditional
+  "not yet implemented" error. Argument encoding follows the contract's
+  actual entrypoint signatures in `intent_settlement/src/lib.rs`.
+- **Jest test suite for `packages/sdk` (issue #481).** Covers every public
+  client method against a mocked Soroban RPC (simulation, submission and
+  result decoding paths), wired into CI so the SDK has regression protection.
+- **On-chain rate-of-change guardrails for protocol parameters (issue #561).**
+  `set_config` now rejects any single-call change to a rate-sensitive parameter
+  (`protocol_fee_bps`, `min_bond`, `fill_window`, `intent_expiry`) that exceeds a
+  hardcoded maximum per-call delta, returning a dedicated `Error::RateOfChangeExceeded`.
+  The guardrail composes with — and does not replace — the existing 48-hour
+  governance timelock: both a magnitude cap and a notice window apply. Limits are
+  hardcoded and documented for v1; making them governance-configurable is out of
+  scope.
 - **Generated "Error Reference" table in `README.md` (issue #531).**
   `scripts/generate-error-reference.py` parses the `Error` enum out of
   `intent_settlement/src/lib.rs` and renders a row for **every** declaration
@@ -19,7 +43,6 @@ All notable changes to this project will be documented in this file.
   is still in sync, or `--write` to regenerate it; `make error-reference-check`
   and `just error-reference-check` wrap the same command. Unit tests for the
   generator live in `scripts/tests/test_generate_error_reference.py`.
-
 - **`governor` contract — on-chain proposal/voting lifecycle (issue #508).**
   New `governor/` crate implementing proposal creation, per-address voting,
   quorum tracking, and permissionless execution once a proposal passes. Core
@@ -86,6 +109,21 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Duplicated escrow/dispute entrypoints merged (issue #98, #342).**
+  `begin_fill`, `release_fill`, and `resolve_dispute` were each defined twice
+  in `intent_settlement/src/lib.rs` (two complete, parallel, never-merged
+  implementations left behind by a bad merge), and dispute opening existed as
+  two separate entrypoints — `open_dispute` and `dispute_fill` — that differed
+  on whether a `DISPUTE_BOND` is required. Each pair is now collapsed into a
+  single implementation, and dispute opening is a single coherent path:
+  `dispute_fill` is the sole dispute-opening entrypoint and requires the
+  `DISPUTE_BOND` (anti-griefing: a user cannot freeze a solver's escrowed fill
+  for the full `DISPUTE_WINDOW` for free, and the bond is returned on an
+  `Upheld` ruling / forfeited to the solver on a `Dismissed` one). The
+  bond-free `open_dispute` variant is removed. The surviving implementations
+  are the later-indexed (newer design iteration) bodies, verified
+  function-by-function against their doc comments; the merged dispute suite
+  covers both previously-divergent paths.
 - Upgraded `soroban-sdk` from `21.0.0` to `22.0.0` across the workspace root and every contract crate (`intent_settlement`, `proof_registry`, `solver_registry`, `reputation_badge`, `backstop_vault`), closing the gap left by issue #377. Migration checklist followed from `docs/event-schema.md` (typed events, test registration API, TTL/auth API notes).
 - **`fee_router` rewritten as a real Soroban contract (issue #464).**
   `fee_router/src/lib.rs` is now a deployable `#![no_std]` contract with
@@ -152,6 +190,10 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`proof_registry` compile failure (issue #97).** `proof_registry` did not
+  type-check, which blocked `intent_settlement` (and its dispute-resolution
+  suite) from being compiled at all; the crate now builds cleanly, unblocking
+  the entrypoint merge above.
 - **Compiling, green baseline (#202, #203, #204)**: `intent_settlement` did
   not build — `lib.rs` referenced ~12 undeclared constants, 9 undeclared
   `DataKey` variants and 6 undeclared `Error` variants, the `Error` enum had
@@ -192,4 +234,122 @@ All notable changes to this project will be documented in this file.
   (requires auth from both the outgoing and incoming admin), and 
   `get_admin`/`get_fee_recipient` views -- previously no rotation path 
   existed for either role.
-- **Emergency pause**: `pause()`/`unpause()`/`is_paused()`,
+- **Emergency pause**: `pause()`/`unpause()`/`is_paused()`, gating
+  `submit_intent`/`accept_intent`/`fill_intent` for incident response.
+  `slash_solver` and `cancel_intent` stay available throughout.
+- **Partial bond withdrawal**: `withdraw_bond(amount)` lets a solver
+  reclaim excess collateral above `MIN_BOND` without fully deregistering.
+- **Permissionless intent expiry**: `expire_intent()` materializes an
+  `Open` intent's `Expired` state once its deadline passes, instead of
+  relying on a lazy check inside `accept_intent`.
+- **Views**: `get_bond_token`, `get_solver_count` (backed by a new
+  `TotalSolvers` stat), `is_solver_eligible`.
+- **Aggregate health view**: `get_protocol_health` bundles `is_paused`,
+  `get_stats`, and `get_solver_count` into a single `ProtocolHealth`
+  struct so dashboard/monitoring integrations need one call instead of
+  three (#112).
+- **Destination token allowlist**: `add_allowed_dst_token` /
+  `remove_allowed_dst_token` / `is_dst_token_allowed`, enforced in
+  `submit_intent` only once an admin opts in via
+  `set_dst_allowlist_enabled` (off by default).
+- **Timelocked admin actions** (#115, #116): sensitive admin changes now go
+  through a propose-then-execute flow with a 48-hour delay, so users and
+  solvers have a window to notice and react before a change takes effect.
+  A distinct `*_proposed` event fires immediately at proposal time, ahead of
+  the delay, giving off-chain monitors advance notice either way.
+  - `set_fee_recipient` is superseded by `propose_fee_recipient` /
+    `accept_fee_recipient`, now timelocked (`get_pending_fee_recipient`
+    returns `(Address, u64 eta)`).
+  - `transfer_admin` is superseded by `propose_admin_transfer` /
+    `accept_admin_transfer`, now timelocked (`get_pending_admin`).
+  - `add_allowed_dst_token` / `remove_allowed_dst_token` are superseded by
+    `propose_add_dst_token` / `execute_add_dst_token` and
+    `propose_remove_dst_token` / `execute_remove_dst_token` (#118).
+    `execute_*` is permissionless once the delay has elapsed, since the
+    change was already authorized by the admin at proposal time.
+- **Enumerable dst_token allowlist** (#117): `list_allowed_dst_tokens()`
+  returns every token currently on the allowlist, so integrators and
+  auditors no longer have to replay `dst_token_allowed` /
+  `dst_token_disallowed` events to reconstruct the full list.
+- **Batch fill / cancel** (#199): `batch_fill_intent(solver, fills)` and
+  `batch_cancel_intent(user, intent_ids)` complete the batch API alongside
+  the existing `batch_submit_intent` / `batch_accept_intent`. All four are
+  capped at `MAX_BATCH_SIZE` and revert the whole batch on any failure.
+  `batch_cancel_intent` checks and stamps the per-user `CANCEL_COOLDOWN`
+  once for the call, so a user can clear all of their open intents in one
+  transaction.
+- **Paginated solver enumeration** (#198): `list_solvers(start, limit)`
+  returns registered solver addresses a bounded page at a time (limit
+  clamped to `MAX_BATCH_SIZE`), kept in sync by `register_solver` /
+  `deregister_solver`. Integrators can enumerate solvers without replaying
+  `solver_registered` / `solver_deregistered` events.
+- **Solana as a fully-supported source chain** (#201): `src_chain =
+  "solana"` is validated end-to-end (base58 SPL mint, 32–44 chars, no `0x`
+  prefix) and documented alongside the EVM chains; the README's "planned"
+  marker is removed.
+- **`solver_registry` contract + tier perks** (#197, partial #186): new
+  `solver_registry/` crate storing an admin-managed tier per solver
+  (Unranked → Platinum) with `get_tier` and the perk-schedule views.
+  `intent_settlement` gains `set_solver_registry(Option<Address>)`: when a
+  registry is linked, `accept_intent` extends the fill window by the tier's
+  bonus (+0 / +10 / +20 / +30 / +50 %) and `slash_solver` slashes at the
+  tier's reduced rate (10 / 10 / 8 / 6 / 5 %, 5% floor). The tier is
+  snapshotted on the `IntentRecord` at accept-time, so a mid-flight
+  promotion/demotion doesn't change the slash. The integration is optional
+  and degrades to Unranked when unset or unreachable — behaviour with no
+  registry is byte-for-byte the pre-#197 flat 10% slash / fixed window.
+  Score-gated promotion, staking and migration remain #186.
+
+### Changed
+
+- CI now also runs a dependency-audit job (`cargo audit` against the
+  RustSec advisory database) alongside the existing fmt/clippy/test/build
+  checks.
+- CI `wasm-size` job now measures the `wasm-opt -Oz` artifact (the size
+  that actually deploys) against a pinned binaryen, and `[profile.release]`
+  enables `lto`. After #197 the optimized `intent_settlement` wasm is
+  ~63.7 KB — within ~1.8 KB of Soroban's 64 KB hard limit — so the budget
+  is 64 500 bytes and a dedicated size-reduction pass is now **blocking**
+  further feature work.
+- Removed the never-functional bid-window scaffolding from
+  `intent_settlement` (`BID_WINDOW`, `BestBidRecord`, `is_bid_window_enabled`
+  and the dead `Bidding` branch in `submit_intent`); `submit_intent` always
+  opened intents as `Open` already. The `IntentState::Bidding` variant is
+  retained as reserved.
+- CI: new `solver-registry` job (fmt / clippy / test / wasm build) for the
+  new crate.
+
+### Documentation
+
+- `packages/sdk/README.md`: removed the "not yet implemented" caveats now
+  that every client method performs a real contract call (#480).
+- README: added `stellar contract invoke` usage examples for the core
+  intent lifecycle and an up-to-date entrypoint list.
+- Filled in missing rustdoc on `unpause`, `is_paused`, and the view
+  functions.
+- Added `docs/110-monitoring-alerting-spec.md`: signals and thresholds an
+  ops team should watch, including slash rate, bond utilization, and
+  pause/unpause activity (#110).
+- Added `docs/111-expire-intent-event-coverage.md`: confirms and documents
+  the gap between the `intent_expired` event and an intent that is merely
+  past its deadline but not yet materialized as `Expired` (#111).
+- Added `docs/113-event-topic-naming-conventions.md`: documents the
+  current event topic conventions in `intent_settlement` and sets the
+  naming convention future contracts (e.g. `solver_registry`) should
+  follow (#113).
+- `docs/132-supported-chains.md`: promoted Solana from "Planned" to
+  "Supported" with full base58/decimals rigor (§3.2) and a real SPL-mint
+  address table (§4.8); noted that `avalanche`/`bsc` `src_token`s are not
+  yet format-checked on-chain (#201).
+- `docs/solver-integration-guide.md`: added per-source-chain guidance for
+  interpreting `src_token` / `src_amount`, including how to resolve a
+  Solana SPL mint and read its (non-uniform) decimals (#201).
+- README: Solana row in the decimal-normalization table; batch and
+  `list_solvers` entrypoints added to the function list (#198, #199, #201).
+- `indexer/reference-indexer.js`: noted `list_solvers` as the on-chain
+  alternative to full `solver_registered` / `solver_deregistered` replay
+  (#198).
+- `docs/solver-registry-design.md`: added an "Implementation status" section
+  recording what #197 shipped, the local-tier-table deviation from §6, the
+  accept-time snapshot decision, and that the §8 fee rebate is deferred and
+  should be unified with #7 (#197).

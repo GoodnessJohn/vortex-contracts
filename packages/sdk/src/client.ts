@@ -32,8 +32,61 @@
  *   }, sourceKeyPair);
  */
 
-import { Address, Contract, Keypair, Server, TransactionBuilder, BASE_FEE, Networks } from 'stellar-sdk';
+import {
+  Address,
+  Contract,
+  Keypair,
+  Server,
+  TransactionBuilder,
+  BASE_FEE,
+  Networks,
+  SorobanRpc,
+  nativeToScVal,
+  scValToNative,
+  xdr,
+} from 'stellar-sdk';
 import * as types from './types';
+
+/**
+ * Convert a 32-byte intent ID (hex string, with or without 0x prefix) to an ScVal BytesN<32>.
+ */
+function intentIdToScVal(intentId: string): xdr.ScVal {
+  const hex = intentId.startsWith('0x') ? intentId.slice(2) : intentId;
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error(`Invalid intent ID: expected 32-byte hex string, got "${intentId}"`);
+  }
+  return nativeToScVal(Buffer.from(hex, 'hex'), { type: 'bytes' });
+}
+
+/**
+ * Convert an ScVal BytesN<32> (or Buffer) to a 0x-prefixed hex string.
+ */
+function scValToIntentId(value: unknown): string {
+  if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
+    return '0x' + Buffer.from(value as Uint8Array).toString('hex');
+  }
+  if (typeof value === 'string') {
+    return value.startsWith('0x') ? value : '0x' + value;
+  }
+  throw new Error(`Unexpected intent ID value from contract: ${String(value)}`);
+}
+
+/**
+ * Extract a meaningful error message from a Soroban RPC error response.
+ */
+function describeRpcError(context: string, error: unknown): Error {
+  if (error instanceof Error) {
+    return new Error(`${context}: ${error.message}`);
+  }
+  if (typeof error === 'string') {
+    return new Error(`${context}: ${error}`);
+  }
+  try {
+    return new Error(`${context}: ${JSON.stringify(error)}`);
+  } catch {
+    return new Error(`${context}: ${String(error)}`);
+  }
+}
 
 export interface VortexClientOptions {
   /**
@@ -84,6 +137,8 @@ export class VortexClient {
   private networkPassphrase: string;
   private baseFee: string;
   private timeout: number;
+  private server: SorobanRpc.Server;
+  private contract: Contract;
 
   constructor(options: VortexClientOptions) {
     this.contractId = options.contractId;
@@ -92,6 +147,130 @@ export class VortexClient {
     this.networkPassphrase = options.networkPassphrase || Networks.TESTNET_NETWORK_PASSPHRASE;
     this.baseFee = options.baseFee || BASE_FEE;
     this.timeout = options.timeout || 30000;
+    this.server = new SorobanRpc.Server(this.rpcUrl, { allowHttp: this.rpcUrl.startsWith('http://') });
+    this.contract = new Contract(this.contractId);
+  }
+
+  /**
+   * Build a Soroban contract invocation operation for the given method and args.
+   */
+  private buildInvokeOperation(method: string, args: xdr.ScVal[]): xdr.Operation {
+    return this.contract.call(method, ...args);
+  }
+
+  /**
+   * Simulate a read-only contract call and decode its return value.
+   * Throws a meaningful error if simulation fails.
+   */
+  private async simulateCall(method: string, args: xdr.ScVal[]): Promise<unknown> {
+    const account = await this.server.getAccount(this.contractId).catch(() => undefined);
+    // Read-only simulations still need a valid source account; use the contract ID's
+    // account only if it exists, otherwise fall back to a random funded-free source.
+    const source = account ? account.accountId() : Keypair.random().publicKey();
+
+    let builder: TransactionBuilder;
+    try {
+      const sourceAccount = account ?? new (await import('stellar-sdk')).Account(source, '0');
+      builder = new TransactionBuilder(sourceAccount, {
+        fee: this.baseFee,
+        networkPassphrase: this.networkPassphrase,
+      });
+    } catch (err) {
+      throw describeRpcError(`Failed to build simulation transaction for ${method}`, err);
+    }
+
+    builder.addOperation(this.buildInvokeOperation(method, args)).setTimeout(this.timeout / 1000);
+    const tx = builder.build();
+
+    let sim: SorobanRpc.SimulateTransactionResponse;
+    try {
+      sim = await this.server.simulateTransaction(tx);
+    } catch (err) {
+      throw describeRpcError(`Simulation of ${method} failed`, err);
+    }
+
+    if (SorobanRpc.Api.isSimulationError(sim)) {
+      throw new Error(`Simulation of ${method} failed: ${sim.error}`);
+    }
+    if (!SorobanRpc.Api.isSimulationSuccess(sim) || !sim.result) {
+      throw new Error(`Simulation of ${method} returned no result`);
+    }
+    return scValToNative(sim.result.retval);
+  }
+
+  /**
+   * Prepare, sign, submit, and await a state-changing contract invocation.
+   * Returns the decoded return value of the contract call.
+   */
+  private async invokeAndSubmit(
+    method: string,
+    args: xdr.ScVal[],
+    signingKeypair: Keypair,
+  ): Promise<unknown> {
+    const account = await this.server.getAccount(signingKeypair.publicKey()).catch((err) => {
+      throw describeRpcError(`Failed to load account ${signingKeypair.publicKey()}`, err);
+    });
+
+    const tx = new TransactionBuilder(account, {
+      fee: this.baseFee,
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(this.buildInvokeOperation(method, args))
+      .setTimeout(this.timeout / 1000)
+      .build();
+
+    let prepared: SorobanRpc.Api.PrepareTransactionResponse;
+    try {
+      prepared = await this.server.prepareTransaction(tx);
+    } catch (err) {
+      throw describeRpcError(`Failed to prepare ${method} transaction`, err);
+    }
+
+    const preparedTx = prepared as unknown as { sign: (...kps: Keypair[]) => void };
+    preparedTx.sign(signingKeypair);
+
+    let sendResponse: SorobanRpc.Api.SendTransactionResponse;
+    try {
+      sendResponse = await this.server.sendTransaction(prepared as unknown as Parameters<SorobanRpc.Server['sendTransaction']>[0]);
+    } catch (err) {
+      throw describeRpcError(`Failed to submit ${method} transaction`, err);
+    }
+
+    if (sendResponse.status === 'ERROR') {
+      throw new Error(
+        `Submission of ${method} failed: ${JSON.stringify(sendResponse.errorResult ?? sendResponse)}`,
+      );
+    }
+
+    const hash = sendResponse.hash;
+    const deadline = Date.now() + this.timeout;
+    let getResponse: SorobanRpc.Api.GetTransactionResponse | undefined;
+    while (Date.now() < deadline) {
+      try {
+        getResponse = await this.server.getTransaction(hash);
+      } catch (err) {
+        throw describeRpcError(`Failed to poll ${method} transaction ${hash}`, err);
+      }
+      if (getResponse.status !== SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    if (!getResponse || getResponse.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+      throw new Error(`Timed out waiting for ${method} transaction ${hash} to confirm`);
+    }
+    if (getResponse.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+      throw new Error(
+        `Transaction ${hash} for ${method} failed: ${JSON.stringify(getResponse.resultXdr ?? getResponse)}`,
+      );
+    }
+
+    const success = getResponse as SorobanRpc.Api.GetSuccessfulTransactionResponse;
+    if (success.returnValue) {
+      return scValToNative(success.returnValue);
+    }
+    return undefined;
   }
 
   /**
@@ -104,10 +283,16 @@ export class VortexClient {
    * Emits: intent_submitted event
    */
   async submitIntent(options: types.SubmitIntentOptions, signingKeypair: Keypair): Promise<string> {
-    // Implementation would construct Soroban invocation for submit_intent
-    // and return the intent ID from the result
-
-    throw new Error('submitIntent not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(options.user).toScVal(),
+      nativeToScVal(options.src_chain, { type: 'string' }),
+      nativeToScVal(options.src_token, { type: 'string' }),
+      nativeToScVal(options.src_amount, { type: 'i128' }),
+      new Address(options.dst_token).toScVal(),
+      nativeToScVal(options.min_dst_amount, { type: 'i128' }),
+    ];
+    const result = await this.invokeAndSubmit('submit_intent', args, signingKeypair);
+    return scValToIntentId(result);
   }
 
   /**
@@ -122,7 +307,11 @@ export class VortexClient {
    * Emits: intent_accepted event
    */
   async acceptIntent(options: types.AcceptIntentOptions, signingKeypair: Keypair): Promise<void> {
-    throw new Error('acceptIntent not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(options.solver).toScVal(),
+      intentIdToScVal(options.intent_id),
+    ];
+    await this.invokeAndSubmit('accept_intent', args, signingKeypair);
   }
 
   /**
@@ -137,7 +326,13 @@ export class VortexClient {
    * Emits: intent_filled event
    */
   async fillIntent(options: types.FillIntentOptions, signingKeypair: Keypair): Promise<void> {
-    throw new Error('fillIntent not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(options.solver).toScVal(),
+      intentIdToScVal(options.intent_id),
+      nativeToScVal(options.fill_amount, { type: 'i128' }),
+      nativeToScVal(Boolean(options.require_proof), { type: 'bool' }),
+    ];
+    await this.invokeAndSubmit('fill_intent', args, signingKeypair);
   }
 
   /**
@@ -152,7 +347,11 @@ export class VortexClient {
    * Emits: intent_cancelled event
    */
   async cancelIntent(intentId: string, signingKeypair: Keypair): Promise<void> {
-    throw new Error('cancelIntent not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      intentIdToScVal(intentId),
+    ];
+    await this.invokeAndSubmit('cancel_intent', args, signingKeypair);
   }
 
   /**
@@ -164,7 +363,12 @@ export class VortexClient {
    * Emits: solver_registered event
    */
   async registerSolver(options: types.RegisterSolverOptions, signingKeypair: Keypair): Promise<void> {
-    throw new Error('registerSolver not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(options.solver).toScVal(),
+      new Address(options.bond_token).toScVal(),
+      nativeToScVal(options.bond_amount, { type: 'i128' }),
+    ];
+    await this.invokeAndSubmit('register_solver', args, signingKeypair);
   }
 
   /**
@@ -174,7 +378,8 @@ export class VortexClient {
    * @param signingKeypair Keypair for transaction signing (must match solver)
    */
   async deregisterSolver(solver: Address, signingKeypair: Keypair): Promise<void> {
-    throw new Error('deregisterSolver not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [new Address(solver.toString()).toScVal()];
+    await this.invokeAndSubmit('deregister_solver', args, signingKeypair);
   }
 
   /**
@@ -189,7 +394,8 @@ export class VortexClient {
    * @returns Whether the solver is eligible
    */
   async isSolverEligible(solver: Address): Promise<boolean> {
-    throw new Error('isSolverEligible not yet implemented in reference SDK');
+    const result = await this.simulateCall('is_solver_eligible', [new Address(solver.toString()).toScVal()]);
+    return Boolean(result);
   }
 
   /**
@@ -199,7 +405,11 @@ export class VortexClient {
    * @returns The intent record, or undefined if not found
    */
   async getIntent(intentId: string): Promise<types.IntentRecord | undefined> {
-    throw new Error('getIntent not yet implemented in reference SDK');
+    const result = await this.simulateCall('get_intent', [intentIdToScVal(intentId)]);
+    if (result === undefined || result === null) {
+      return undefined;
+    }
+    return result as types.IntentRecord;
   }
 
   /**
@@ -209,7 +419,11 @@ export class VortexClient {
    * @returns The solver record, or undefined if not registered
    */
   async getSolver(solver: Address): Promise<types.SolverRecord | undefined> {
-    throw new Error('getSolver not yet implemented in reference SDK');
+    const result = await this.simulateCall('get_solver', [new Address(solver.toString()).toScVal()]);
+    if (result === undefined || result === null) {
+      return undefined;
+    }
+    return result as types.SolverRecord;
   }
 
   /**
@@ -219,7 +433,12 @@ export class VortexClient {
    * @returns Array of open intent IDs (paginated, up to MAX_PAGE_SIZE per call)
    */
   async listOpenIntents(options?: types.ListIntentsOptions): Promise<string[]> {
-    throw new Error('listOpenIntents not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      nativeToScVal(options?.offset ?? 0, { type: 'u32' }),
+      nativeToScVal(options?.limit ?? 0, { type: 'u32' }),
+    ];
+    const result = await this.simulateCall('list_open_intents', args);
+    return this.decodeIntentIdList(result);
   }
 
   /**
@@ -229,7 +448,18 @@ export class VortexClient {
    * @returns Array of intent IDs submitted by this user
    */
   async listIntentsByUser(user: Address): Promise<string[]> {
-    throw new Error('listIntentsByUser not yet implemented in reference SDK');
+    const result = await this.simulateCall('list_intents_by_user', [new Address(user.toString()).toScVal()]);
+    return this.decodeIntentIdList(result);
+  }
+
+  /**
+   * Decode a contract return value into an array of 0x-prefixed intent ID hex strings.
+   */
+  private decodeIntentIdList(result: unknown): string[] {
+    if (!Array.isArray(result)) {
+      return [];
+    }
+    return result.map((value) => scValToIntentId(value));
   }
 
   /**
@@ -238,7 +468,8 @@ export class VortexClient {
    * @returns Whether pause() has been called and unpause() has not been called since
    */
   async isPaused(): Promise<boolean> {
-    throw new Error('isPaused not yet implemented in reference SDK');
+    const result = await this.simulateCall('is_paused', []);
+    return Boolean(result);
   }
 
   /**
@@ -247,7 +478,8 @@ export class VortexClient {
    * @returns Protocol config (min_bond, fill_window, intent_expiry, protocol_fee_bps, etc.)
    */
   async getConfig(): Promise<types.ProtocolConfig> {
-    throw new Error('getConfig not yet implemented in reference SDK');
+    const result = await this.simulateCall('get_config', []);
+    return result as types.ProtocolConfig;
   }
 
   /**
@@ -257,7 +489,8 @@ export class VortexClient {
    * @returns Base fee, effective fee after discount, and list of tiers
    */
   async getFeeSchedule(solver: Address): Promise<types.FeeSchedule> {
-    throw new Error('getFeeSchedule not yet implemented in reference SDK');
+    const result = await this.simulateCall('get_fee_schedule', [new Address(solver.toString()).toScVal()]);
+    return result as types.FeeSchedule;
   }
 
   /**
@@ -266,7 +499,8 @@ export class VortexClient {
    * @returns Total intents, TVL, solvers, bonds, fees collected, state breakdown
    */
   async getProtocolHealth(): Promise<types.ProtocolHealth> {
-    throw new Error('getProtocolHealth not yet implemented in reference SDK');
+    const result = await this.simulateCall('get_protocol_health', []);
+    return result as types.ProtocolHealth;
   }
 
   /**
@@ -279,7 +513,11 @@ export class VortexClient {
    * Emits: fee_recipient_transfer_proposed event
    */
   async proposeFeeRecipient(newFeeRecipient: Address, signingKeypair: Keypair): Promise<void> {
-    throw new Error('proposeFeeRecipient not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      new Address(newFeeRecipient.toString()).toScVal(),
+    ];
+    await this.invokeAndSubmit('propose_fee_recipient', args, signingKeypair);
   }
 
   /**
@@ -291,7 +529,8 @@ export class VortexClient {
    * Emits: fee_recipient_transfer_completed event
    */
   async acceptFeeRecipient(signingKeypair: Keypair): Promise<void> {
-    throw new Error('acceptFeeRecipient not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [new Address(signingKeypair.publicKey()).toScVal()];
+    await this.invokeAndSubmit('accept_fee_recipient', args, signingKeypair);
   }
 
   /**
@@ -304,7 +543,11 @@ export class VortexClient {
    * Emits: admin_transfer_proposed event
    */
   async proposeAdminTransfer(newAdmin: Address, signingKeypair: Keypair): Promise<void> {
-    throw new Error('proposeAdminTransfer not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      new Address(newAdmin.toString()).toScVal(),
+    ];
+    await this.invokeAndSubmit('propose_admin_transfer', args, signingKeypair);
   }
 
   /**
@@ -316,7 +559,8 @@ export class VortexClient {
    * Emits: admin_transfer_completed event
    */
   async acceptAdminTransfer(signingKeypair: Keypair): Promise<void> {
-    throw new Error('acceptAdminTransfer not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [new Address(signingKeypair.publicKey()).toScVal()];
+    await this.invokeAndSubmit('accept_admin_transfer', args, signingKeypair);
   }
 
   /**
@@ -328,7 +572,11 @@ export class VortexClient {
    * Addition takes effect after ADMIN_TIMELOCK_DELAY (48 hours)
    */
   async proposeAddDstToken(token: Address, signingKeypair: Keypair): Promise<void> {
-    throw new Error('proposeAddDstToken not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      new Address(token.toString()).toScVal(),
+    ];
+    await this.invokeAndSubmit('propose_add_dst_token', args, signingKeypair);
   }
 
   /**
@@ -338,7 +586,11 @@ export class VortexClient {
    * @param signingKeypair Admin keypair for signing
    */
   async addAllowedSrcChain(chain: string, signingKeypair: Keypair): Promise<void> {
-    throw new Error('addAllowedSrcChain not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      nativeToScVal(chain, { type: 'string' }),
+    ];
+    await this.invokeAndSubmit('add_allowed_src_chain', args, signingKeypair);
   }
 
   /**
@@ -348,7 +600,8 @@ export class VortexClient {
    * @returns Whether this chain is allowed
    */
   async isSrcChainAllowed(chain: string): Promise<boolean> {
-    throw new Error('isSrcChainAllowed not yet implemented in reference SDK');
+    const result = await this.simulateCall('is_src_chain_allowed', [nativeToScVal(chain, { type: 'string' })]);
+    return Boolean(result);
   }
 
   /**
@@ -368,7 +621,11 @@ export class VortexClient {
    * Emits: solver_slashed event
    */
   async slashSolver(intentId: string, signingKeypair: Keypair): Promise<void> {
-    throw new Error('slashSolver not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      intentIdToScVal(intentId),
+    ];
+    await this.invokeAndSubmit('slash_solver', args, signingKeypair);
   }
 
   /**
@@ -380,6 +637,12 @@ export class VortexClient {
    * @param signingKeypair Admin keypair for signing
    */
   async rescueTokens(token: Address, to: Address, amount: bigint, signingKeypair: Keypair): Promise<void> {
-    throw new Error('rescueTokens not yet implemented in reference SDK');
+    const args: xdr.ScVal[] = [
+      new Address(signingKeypair.publicKey()).toScVal(),
+      new Address(token.toString()).toScVal(),
+      new Address(to.toString()).toScVal(),
+      nativeToScVal(amount, { type: 'i128' }),
+    ];
+    await this.invokeAndSubmit('rescue_tokens', args, signingKeypair);
   }
 }

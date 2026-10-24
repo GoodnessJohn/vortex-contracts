@@ -24,6 +24,10 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
     Env, Symbol, Vec,
 };
+use vortex_common::{
+    DAY_IN_LEDGERS, INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO,
+    PERSISTENT_TTL_THRESHOLD,
+};
 
 #[cfg(test)]
 mod test;
@@ -59,6 +63,12 @@ const FILL_WINDOW_BONUS_PCT: [u32; 5] = [0, 10, 20, 30, 50];
 
 /// Fixed (non-tunable) perk: slash size in basis points of bond, per tier
 /// (design §3 / §7). Tier 0 and 1 pay the full 10%.
+///
+/// NOTE: this table **intentionally diverges** from
+/// `vortex_common::compute_slash_bps` / `vortex_common::TIER_SLASH_BPS`, which
+/// model a linear `tier * 100` schedule. The design doc's tiered-staking
+/// schedule is non-linear (tiers 0 and 1 both pay 10%, then 8% / 6% / 5%), so
+/// it is kept local rather than migrated to the shared helper.
 const SLASH_BPS: [u32; 5] = [1_000, 1_000, 800, 600, 500];
 
 /// Fixed perk slot: fee rebate in basis points, per tier (design §3 / §8).
@@ -75,12 +85,10 @@ const MAX_TUNABLE_MIN_BOND: i128 = 1_000_000 * USDC;
 const MAX_TUNABLE_MIN_SCORE_BPS: u32 = 9_999;
 
 // ─── TTL bumping (see docs/ttl-constants-rationale.md) ───────────────────────
-
-const DAY_IN_LEDGERS: u32 = 17_280; // ~5s per ledger
-const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14;
-const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
-const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
-const INSTANCE_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 60;
+//
+// `DAY_IN_LEDGERS`, `PERSISTENT_TTL_THRESHOLD`, `PERSISTENT_TTL_EXTEND_TO`,
+// `INSTANCE_TTL_THRESHOLD` and `INSTANCE_TTL_EXTEND_TO` are imported from
+// `vortex_common` (values are identical to the ones previously defined here).
 
 /// Delay between `propose_admin` and `accept_admin` (issue #393). Matches
 /// `intent_settlement`'s `ADMIN_TIMELOCK_DELAY`.
@@ -207,6 +215,9 @@ pub enum Error {
     AdminTimelockNotElapsed = 17,
     /// `accept_admin` / `cancel_admin_transfer` with no handover pending.
     NoPendingAdminTransfer = 18,
+    /// `unstake` / `deregister_solver` attempted while the solver still holds
+    /// open obligations in settlement (issue #542).
+    OpenObligations = 19,
 }
 
 // ─── Reputation formula ──────────────────────────────────────────────────────
@@ -563,10 +574,22 @@ impl SolverRegistry {
 
     /// Withdraw `amount` of bond. The remaining balance must still clear the
     /// tier-0 floor — use [`SolverRegistry::deregister_solver`] to exit fully.
+    ///
+    /// **Obligation policy (issue #542):** *any* unstake is rejected with
+    /// [`Error::OpenObligations`] while the solver holds one or more open
+    /// obligations in settlement (`get_open_obligations(solver) > 0`). Partial
+    /// unstaking while obligated is deliberately **not** allowed: the bond is
+    /// the collateral backing every open obligation, so reducing it — even to
+    /// a level that still clears the tier-0 floor — could leave those
+    /// obligations under-collateralised. The solver must wait for settlement
+    /// to release its obligations before withdrawing any bond.
     pub fn unstake(env: Env, solver: Address, amount: i128) {
         solver.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, Error::ZeroAmount);
+        }
+        if Self::open_obligations(&env, &solver) > 0 {
+            panic_with_error!(&env, Error::OpenObligations);
         }
         let mut record = Self::load_solver(&env, &solver);
         if amount > record.bond_amount {
@@ -593,8 +616,15 @@ impl SolverRegistry {
 
     /// Exit the registry: returns the full remaining bond and deletes the
     /// record.
+    ///
+    /// Rejected with [`Error::OpenObligations`] while the solver holds any
+    /// open obligations in settlement (issue #542): deregistering would
+    /// return the collateral backing them.
     pub fn deregister_solver(env: Env, solver: Address) {
         solver.require_auth();
+        if Self::open_obligations(&env, &solver) > 0 {
+            panic_with_error!(&env, Error::OpenObligations);
+        }
         let record = Self::load_solver(&env, &solver);
 
         env.storage()
@@ -1037,25 +1067,6 @@ impl SolverRegistry {
     fn bump_persistent_ttl(env: &Env, key: &DataKey) {
         env.storage().persistent().extend_ttl(
             key,
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND_TO,
-        );
-    }
-
-    fn bump_instance_ttl(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
-    }
-
-    fn bump_solver_ttl(env: &Env, solver: &Address) {
-        env.storage().persistent().extend_ttl(
-            &DataKey::Solver(solver.clone()),
-            PERSISTENT_TTL_THRESHOLD,
-            PERSISTENT_TTL_EXTEND_TO,
-        );
-    }
-}
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_EXTEND_TO,
         );
