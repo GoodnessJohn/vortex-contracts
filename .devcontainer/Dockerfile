@@ -20,6 +20,9 @@ RUN cargo install --locked cargo-audit
 # Install just for task running (alternative to make)
 RUN cargo install --locked just
 
+# Install Kani verifier and run its one-time setup so `make kani` works out of the box
+RUN cargo install --locked kani-verifier && cargo kani setup
+
 # Create setup script that runs on container creation
 RUN echo '#!/bin/bash\n\
 set -e\n\
@@ -28,6 +31,7 @@ echo "Vortex Contracts devcontainer setup..."\n\
 # Verify toolchain versions\n\
 echo "Rust version: $(rustc --version)"\n\
 echo "Stellar CLI version: $(stellar --version 2>&1 || echo \"stellar command ready\")"\n\
+echo "Kani version: $(cargo kani --version 2>&1 || echo \"kani command ready\")"\n\
 \n\
 # Pre-fetch dependencies to speed up first build\n\
 echo "Pre-fetching cargo dependencies..."\n\
