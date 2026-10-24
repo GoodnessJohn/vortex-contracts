@@ -46,7 +46,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    IntoVal, Map, Symbol, Val, Vec,
+    IntoVal, Map, String, Symbol, Val, Vec,
 };
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
