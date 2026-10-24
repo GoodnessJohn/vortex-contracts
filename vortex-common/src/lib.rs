@@ -171,6 +171,11 @@ pub fn compute_slash_bps(tier: u32) -> i128 {
 /// Returns [`CommonError::NotInitialized`] if no admin is stored under
 /// `admin_key`, and [`CommonError::Unauthorized`] if `caller` is not the admin.
 ///
+/// `admin_key` is the instance-storage key under which the admin `Address` is
+/// stored. It must be a concrete storage-key type (e.g. a `Symbol` or a
+/// contract-defined key enum) that implements `IntoVal<Env, Val>` so it can be
+/// passed to `storage().instance().get(...)`.
+///
 /// #575: The `IntoVal` bound was written as `IntoVal<Env>` with a single
 /// generic argument, but the trait takes two (`IntoVal<E, T>`). The crate
 /// therefore did not compile, which blocked the unit-test suite — and with it

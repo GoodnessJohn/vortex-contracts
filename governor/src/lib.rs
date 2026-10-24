@@ -1,3 +1,25 @@
+//! Stake-weighted Governor for protocol parameter changes.
+//!
+//! Voting power is derived from solver bond plus delegated stake recorded in
+//! `solver_registry` checkpoints. Power is snapshotted at proposal creation so
+//! stake acquired after the snapshot cannot influence an in-flight vote
+//! (anti-flash-stake). Passed proposals are queued into the
+//! `TimelockController` and executed after the timelock delay.
+//!
+//! ## Voting power source (v1)
+//!
+//! The governor maintains its own checkpoint history per account, fed by an
+//! explicit `sync_power` call. `sync_power` reads the account's current bond
+//! from `solver_registry` (the v1 source of truth) and appends a `Checkpoint`
+//! at the current ledger. This keeps the governor self-contained (no
+//! cross-contract read at vote time) while still deriving power from the
+//! registry's bond data.
+//!
+//! Delegation (bond + delegated stake) is a documented follow-up and is out of
+//! scope for v1: only the account's own bond contributes to its power.
+
+#![no_std]
+
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Val, Vec};
 use vortex_common::require_admin;
 
@@ -107,6 +129,19 @@ impl Governor {
         env.storage().instance().set(&key, &config);
         env.storage().instance().set(&Symbol::new(&env, "count"), &0u32);
         Ok(())
+    }
+
+    /// Record the caller's current voting power as a checkpoint.
+    ///
+    /// Reads the account's bond from `solver_registry` (v1 source of truth)
+    /// and appends a `Checkpoint` at the current ledger. Must be called by the
+    /// account itself so power cannot be forged for another address.
+    pub fn sync_power(env: Env, account: Address) -> Result<i128, GovernorError> {
+        account.require_auth();
+        let config = Self::config(&env)?;
+        let power = Self::read_registry_bond(&env, &config.registry, &account);
+        Self::write_checkpoint(&env, &account, power);
+        Ok(power)
     }
 
     /// Create a proposal. Voting power is snapshotted at the current ledger.

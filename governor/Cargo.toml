@@ -11,10 +11,12 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 vortex-common = { path = "../vortex-common" }
+solver_registry = { path = "../solver_registry" }
 timelock = { path = "../timelock" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+solver_registry = { path = "../solver_registry", features = ["testutils"] }
 timelock = { path = "../timelock", features = ["testutils"] }
 
 [features]
