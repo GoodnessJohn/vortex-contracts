@@ -11,6 +11,11 @@
 //! tier-computation logic (issue #1) whenever a solver's tier changes.
 //! Until that contract exists, both entry points are gated behind
 //! `require_admin` as a placeholder authority.
+//!
+//! This crate only records a `Tier` and performs no slash math, so it has no
+//! duplication of `vortex_common::TIER_SLASH_BPS` / `compute_slash_bps` to
+//! migrate (audited for issue #504). Any TTL constants added here later should
+//! be imported from `vortex_common` rather than redefined locally.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol};
 

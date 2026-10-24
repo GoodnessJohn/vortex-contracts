@@ -386,10 +386,212 @@ stellar contract invoke \
 
 # Inspect a sink's claimable balance for a token
 stellar contract invoke \
-  --id $FEE_ROUTER_ID \
+      --id $FEE_ROUTER_ID \
+      --source <ANY_KEY> \
+      --network mainnet -- \
+      claimable \
+      --sink <TREASURY_ADDRESS> \
+      --token <USDC_SAC_ADDRESS>
+```
+
+---
+
+## Deploy the Solver Registry
+
+The `solver_registry` contract tracks solver tiers and provides tier-based
+perks (fill-window bonus, reduced slash rate). It must be deployed and
+initialized before pointing the settlement contract at it.
+
+### Build the artifact
+
+```bash
+cd solver_registry
+stellar contract build
+ls -lh target/wasm32-unknown-unknown/release/vortex_solver_registry.wasm
+```
+
+### Deploy and initialize
+
+```bash
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/vortex_solver_registry.wasm \
+  --source <DEPLOYER_SECRET_KEY> \
+  --network mainnet
+
+SOLVER_REGISTRY_ID=<paste the output here>
+
+stellar contract invoke \
+  --id $SOLVER_REGISTRY_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  initialize \
+  --admin <ADMIN_ADDRESS>
+```
+
+### Configure tier perks
+
+```bash
+# Set fill-window bonus and slash rate per tier (basis points)
+# Tier 0 = Unranked, 1 = Bronze, 2 = Silver, 3 = Gold, 4 = Platinum
+stellar contract invoke \
+  --id $SOLVER_REGISTRY_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  set_tier_perks \
+  --tier 1 \
+  --fill_window_bonus_bps 500 \
+  --slash_bps 500
+
+# Verify
+stellar contract invoke \
+  --id $SOLVER_REGISTRY_ID \
   --source <ANY_KEY> \
   --network mainnet -- \
-  claimable \
-  --sink <TREASURY_ADDRESS> \
-  --token <USDC_SAC_ADDRESS>
+  get_fill_window_bonus_bps \
+  --tier 1
 ```
+
+### Point the settlement contract at the registry
+
+```bash
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  set_solver_registry \
+  --registry $SOLVER_REGISTRY_ID
+```
+
+---
+
+## Configure Source Chain Allowlist
+
+If you want to restrict which source chains users can submit intents from
+(recommended for mainnet), configure and enable the allowlist before going live.
+
+```bash
+# Allow Ethereum mainnet
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  add_allowed_src_chain \
+  --chain "ethereum"
+
+# Add additional chains as needed
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  add_allowed_src_chain \
+  --chain "base"
+
+# Verify
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source <ANY_KEY> \
+  --network mainnet -- \
+  is_src_chain_allowed \
+  --chain "ethereum"
+# Expected: true
+
+# Enable enforcement
+stellar contract invoke \
+  --id $CONTRACT_ID \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet -- \
+  set_src_allowlist_enabled \
+  --enabled true
+```
+
+---
+
+## Rollback Procedure
+
+If any post-deploy verification fails or an incident is detected within the
+first 24 hours, follow this procedure:
+
+1. **Pause the contract immediately**:
+   ```bash
+   stellar contract invoke \
+     --id $CONTRACT_ID \
+     --source <ADMIN_SECRET_KEY> \
+     --network mainnet -- \
+     pause
+   ```
+
+2. **Verify paused state**:
+   ```bash
+   stellar contract invoke \
+     --id $CONTRACT_ID \
+     --source <ANY_KEY> \
+     --network mainnet -- \
+     is_paused
+   # Expected: true
+   ```
+
+3. **Investigate the issue** using on-chain data and logs.
+
+4. **If a fix is required**, deploy a new wasm and upgrade:
+   ```bash
+   stellar contract deploy \
+     --wasm target/wasm32-unknown-unknown/release/vortex_intent_settlement.wasm \
+     --source <DEPLOYER_SECRET_KEY> \
+     --network mainnet
+
+   stellar contract invoke \
+     --id $CONTRACT_ID \
+     --source <ADMIN_SECRET_KEY> \
+     --network mainnet -- \
+     upgrade \
+     --new_wasm_hash <NEW_WASM_HASH>
+   ```
+
+5. **If rollback to previous version**, ensure you have the previous wasm hash
+   and use the same upgrade process.
+
+6. **Unpause after resolution**:
+   ```bash
+   stellar contract invoke \
+     --id $CONTRACT_ID \
+     --source <ADMIN_SECRET_KEY> \
+     --network mainnet -- \
+     unpause
+   ```
+
+---
+
+## Incident Response
+
+### Key contacts
+| Role | Contact | Responsibility |
+|------|---------|----------------|
+| Protocol Admin | <ADMIN_ADDRESS> | Pause/unpause, upgrade, config changes |
+| Fee Recipient | <FEE_RECIPIENT_ADDRESS> | Monitor fee distribution |
+| On-call Engineer | <SLACK/PAGERDUTY> | First responder for alerts |
+
+### Alerting
+- Configure Stellar RPC alerts for `pause` events
+- Monitor `get_stats` for anomalous volume spikes
+- Watch for `slash_solver` events (indicates solver failures)
+
+### Escalation
+1. Pause contract (admin action)
+2. Notify on-call engineer
+3. Assess impact and coordinate fix
+4. Communicate status to community via Discord/Twitter
+5. Execute rollback or upgrade as needed
+
+---
+
+## Post-Deployment Checklist (24h)
+
+- [ ] Contract is not paused (`is_paused` = false)
+- [ ] Stats show expected activity (`get_stats`)
+- [ ] Destination token allowlist enforced if configured
+- [ ] Source chain allowlist enforced if configured
+- [ ] Solver registry linked and tier perks verified
+- [ ] Fee router distributing correctly (`distribute` called successfully)
+- [ ] No unexpected `slash_solver` or `dispute_fill` events
+- [ ] Monitoring dashboards green
+- [ ] Team notified of successful deployment

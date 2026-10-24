@@ -260,3 +260,356 @@ export function getErrorMessage(code: ErrorCode | number): string {
  * Version of these types (should match intent_settlement version)
  */
 export const TYPES_VERSION = "0.1.0";
+
+/* =========================================================================
+ * governor
+ * ========================================================================= */
+
+/**
+ * A single voting checkpoint for an account (governor::Checkpoint)
+ */
+export interface Checkpoint {
+  /** Ledger sequence at which the checkpoint was recorded */
+  ledger: number; // u32
+
+  /** Cumulative voting power at this checkpoint */
+  votes: string; // i128 as string for precision
+}
+
+/**
+ * Vote direction (governor::VoteType)
+ */
+export enum VoteType {
+  Against = "Against",
+  For = "For",
+  Abstain = "Abstain",
+}
+
+/**
+ * Lifecycle state of a proposal (governor::ProposalState)
+ */
+export enum ProposalState {
+  Pending = "Pending",
+  Active = "Active",
+  Defeated = "Defeated",
+  Succeeded = "Succeeded",
+  Queued = "Queued",
+  Executed = "Executed",
+  Cancelled = "Cancelled",
+}
+
+/**
+ * A governance proposal (governor::Proposal)
+ */
+export interface Proposal {
+  /** Unique proposal identifier */
+  id: number; // u64
+
+  /** Account that created the proposal */
+  proposer: string; // Stellar Address
+
+  /** Ordered list of contract calls to execute on success */
+  targets: string[]; // Vec<Stellar Address>
+
+  /** Function names to invoke on each target */
+  functions: string[]; // Vec<String>
+
+  /** Arguments for each call */
+  args: string[]; // Vec<String>
+
+  /** Ledger at which voting begins */
+  start_ledger: number; // u32
+
+  /** Ledger at which voting ends */
+  end_ledger: number; // u32
+
+  /** Votes cast in favour */
+  for_votes: string; // i128 as string for precision
+
+  /** Votes cast against */
+  against_votes: string; // i128 as string for precision
+
+  /** Votes abstained */
+  abstain_votes: string; // i128 as string for precision
+
+  /** Whether the proposal has been executed */
+  executed: boolean;
+
+  /** Whether the proposal has been cancelled */
+  cancelled: boolean;
+}
+
+/**
+ * Governor configuration (governor::GovernorConfig)
+ */
+export interface GovernorConfig {
+  /** Governance token contract address */
+  token: string; // Stellar Address
+
+  /** Voting delay in ledgers after proposal creation */
+  voting_delay: number; // u32
+
+  /** Voting period in ledgers */
+  voting_period: number; // u32
+
+  /** Minimum votes required for a proposal to succeed */
+  quorum: string; // i128 as string for precision
+
+  /** Minimum votes required to submit a proposal */
+  proposal_threshold: string; // i128 as string for precision
+
+  /** Timelock delay in ledgers before execution */
+  timelock_delay: number; // u32
+}
+
+/**
+ * Governor error codes (governor::Error)
+ */
+export enum GovernorError {
+  AlreadyInitialized = 1,
+  NotInitialized = 2,
+  Unauthorized = 3,
+  ProposalNotFound = 4,
+  ProposalNotActive = 5,
+  ProposalNotSucceeded = 6,
+  ProposalNotQueued = 7,
+  ProposalAlreadyExecuted = 8,
+  ProposalAlreadyCancelled = 9,
+  VotingClosed = 10,
+  VotingNotStarted = 11,
+  AlreadyVoted = 12,
+  BelowProposalThreshold = 13,
+  QuorumNotReached = 14,
+  TimelockNotReady = 15,
+  InvalidConfig = 16,
+  ZeroAmount = 17,
+  NoVotingPower = 18,
+}
+
+/* =========================================================================
+ * treasury_streams
+ * ========================================================================= */
+
+/**
+ * A linear vesting stream (treasury_streams::Stream)
+ */
+export interface Stream {
+  /** Unique stream identifier */
+  id: number; // u64
+
+  /** Account that created the stream (funder) */
+  sender: string; // Stellar Address
+
+  /** Account receiving the streamed tokens */
+  recipient: string; // Stellar Address
+
+  /** Streamed token contract address */
+  token: string; // Stellar Address
+
+  /** Total amount to be streamed over the duration */
+  total_amount: string; // i128 as string for precision
+
+  /** Amount already withdrawn by the recipient */
+  withdrawn: string; // i128 as string for precision
+
+  /** Ledger timestamp at which streaming begins */
+  start_time: number; // u64
+
+  /** Ledger timestamp at which streaming ends */
+  end_time: number; // u64
+
+  /** Whether the stream has been cancelled */
+  cancelled: boolean;
+
+  /** Whether the stream has been fully withdrawn/closed */
+  closed: boolean;
+}
+
+/**
+ * Storage keys for treasury_streams (treasury_streams::DataKey)
+ */
+export enum TreasuryStreamsDataKey {
+  Admin = "Admin",
+  NextStreamId = "NextStreamId",
+  Stream = "Stream",
+}
+
+/**
+ * Treasury streams error codes (treasury_streams::Error)
+ */
+export enum TreasuryStreamsError {
+  AlreadyInitialized = 1,
+  NotInitialized = 2,
+  Unauthorized = 3,
+  StreamNotFound = 4,
+  InvalidTimeRange = 5,
+  ZeroAmount = 6,
+  StreamCancelled = 7,
+  StreamClosed = 8,
+  NothingToWithdraw = 9,
+  InsufficientBalance = 10,
+  InvalidConfig = 11,
+}
+
+/* =========================================================================
+ * fee_router
+ * ========================================================================= */
+
+/**
+ * A fee sink destination (fee_router::Sink)
+ */
+export interface Sink {
+  /** Recipient address for routed fees */
+  recipient: string; // Stellar Address
+
+  /** Share of fees routed to this sink, in basis points */
+  share_bps: number; // u32
+}
+
+/**
+ * Fee router configuration (fee_router::RouterConfig)
+ */
+export interface FeeRouterConfig {
+  /** Token in which fees are denominated */
+  fee_token: string; // Stellar Address
+
+  /** Ordered list of fee sinks */
+  sinks: Sink[]; // Vec<Sink>
+
+  /** Whether the router is paused */
+  paused: boolean;
+}
+
+/**
+ * Fee router error codes (fee_router::Error)
+ */
+export enum FeeRouterError {
+  AlreadyInitialized = 1,
+  NotInitialized = 2,
+  Unauthorized = 3,
+  InvalidSinks = 4,
+  SinkNotFound = 5,
+  ZeroAmount = 6,
+  Overflow = 7,
+  ContractPaused = 8,
+  InvalidConfig = 9,
+  NoSinks = 10,
+}
+
+/* =========================================================================
+ * backstop_vault
+ * ========================================================================= */
+
+/**
+ * A depositor's position in the backstop vault (backstop_vault::Position)
+ */
+export interface BackstopPosition {
+  /** Account that owns the position */
+  owner: string; // Stellar Address
+
+  /** Amount of tokens deposited */
+  amount: string; // i128 as string for precision
+
+  /** Ledger timestamp at which the position was opened */
+  deposited_at: number; // u64
+
+  /** Ledger timestamp at which the lockup expires */
+  unlock_at: number; // u64
+
+  /** Whether the position has been withdrawn */
+  withdrawn: boolean;
+}
+
+/**
+ * Vault configuration (backstop_vault::VaultConfig)
+ */
+export interface BackstopVaultConfig {
+  /** Token accepted for deposits */
+  token: string; // Stellar Address
+
+  /** Minimum deposit amount */
+  min_deposit: string; // i128 as string for precision
+
+  /** Lockup duration in seconds */
+  lockup_period: number; // u64
+
+  /** Maximum total deposits the vault will accept */
+  capacity: string; // i128 as string for precision
+}
+
+/**
+ * Backstop vault error codes (backstop_vault::Error)
+ */
+export enum BackstopVaultError {
+  AlreadyInitialized = 1,
+  NotInitialized = 2,
+  Unauthorized = 3,
+  PositionNotFound = 4,
+  BelowMinDeposit = 5,
+  CapacityExceeded = 6,
+  StillLocked = 7,
+  AlreadyWithdrawn = 8,
+  ZeroAmount = 9,
+  InvalidConfig = 10,
+  ContractPaused = 11,
+}
+
+/* =========================================================================
+ * intent_periphery
+ * ========================================================================= */
+
+/**
+ * A batched intent submission (intent_periphery::BatchIntent)
+ */
+export interface BatchIntent {
+  /** Source chain identifier */
+  src_chain: string;
+
+  /** Token address on source chain */
+  src_token: string;
+
+  /** Amount to swap in source token's smallest unit */
+  src_amount: string; // i128 as string for precision
+
+  /** Destination token on Stellar */
+  dst_token: string; // Stellar Address
+
+  /** Minimum acceptable output */
+  min_dst_amount: string; // i128 as string for precision
+
+  /** Deadline by which the intent must be filled */
+  deadline: number; // u64
+}
+
+/**
+ * Result of a batch submission (intent_periphery::BatchResult)
+ */
+export interface BatchResult {
+  /** Intent IDs created for each submitted intent */
+  intent_ids: string[]; // Vec<BytesN<32> as hex string>
+
+  /** Number of intents successfully created */
+  created: number; // u32
+
+  /** Number of intents that failed validation */
+  failed: number; // u32
+}
+
+/**
+ * Intent periphery error codes (intent_periphery::Error)
+ */
+export enum IntentPeripheryError {
+  AlreadyInitialized = 1,
+  NotInitialized = 2,
+  Unauthorized = 3,
+  EmptyBatch = 4,
+  BatchTooLarge = 5,
+  InvalidIntent = 6,
+  ZeroAmount = 7,
+  InvalidDeadline = 8,
+  SettlementCallFailed = 9,
+  InvalidConfig = 10,
+}
+</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>

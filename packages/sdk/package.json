@@ -19,6 +19,9 @@
   ],
   "author": "Vortex Protocol",
   "license": "MIT",
+  "dependencies": {
+    "soroban-client": "^1.0.0"
+  },
   "peerDependencies": {
     "stellar-sdk": "^11.0.0"
   },
@@ -31,6 +34,13 @@
     "eslint": "^8.0.0",
     "@typescript-eslint/eslint-plugin": "^6.0.0",
     "@typescript-eslint/parser": "^6.0.0"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "testMatch": [
+      "<rootDir>/src/**/*.test.ts"
+    ]
   },
   "repository": {
     "type": "git",
