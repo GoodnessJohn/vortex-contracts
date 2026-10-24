@@ -767,3 +767,20 @@ fn remove_chain_succeeds_after_set_configurator() {
     c.remove_chain(&chain);
     assert_eq!(c.get_authorized_axelar_source(&chain), None);
 }
+
+// ─── Proptest: payload decoding (nightly fuzz target) ────────────────────────
+
+mod proptest_payload {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any 102-byte payload whose chain matches the envelope decodes to the
+        /// exact amount and chain that were encoded.
+        #[test]
+        fn proptest_payload_roundtrip(
+            seed in any::<u8>(),
+            chain in 1u16..=u16::MAX,
+            amount in any::<i128>(),
+            sequence in any::<u64>(),
+       
