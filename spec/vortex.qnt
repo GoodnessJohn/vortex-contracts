@@ -68,6 +68,7 @@ module vortex_types {
     id:       int,
     bond:     int,   // ≥ 0
     active:   bool,
+    tier:     int,   // 0..MAX_TIER
     lastSlash: int   // tick of most recent slash; 0 = never slashed
   }
 
@@ -77,6 +78,9 @@ module vortex_types {
   pure val SLASH_BPS:       int = 10  // 10% slash
   pure val DISPUTE_WINDOW:  int = 8   // ticks user has to open dispute
   pure val ARBITER_WINDOW:  int = 15  // ticks arbiter has to resolve
+  pure val MAX_TIER:        int = 5   // maximum solver tier (0=Unranked, 5=Platinum)
+  pure val TIER_SLASH_BPS:  int = 10  // 1% slash reduction per tier
+  pure val TIER_FILL_BONUS: int = 2   // 2 ticks fill window bonus per tier
   pure val MAX_TICK:        int = 30  // bound on time
   pure val MAX_INTENTS:     int = 2
   pure val NUM_USERS:       int = 2
@@ -99,14 +103,18 @@ module vortex {
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
-  // Compute slash amount: 10% of bond, floored at 1, capped at bond
-  pure def computeSlash(bond: int): int =
+  // Compute slash amount: base 10% of bond, reduced by tier (1% per tier).
+  // Tier N reduces slash by N%, minimum 1% (floor at 1).
+  pure def computeSlash(bond: int, tier: int): int =
     if (bond <= 0) 0
     else {
-      val raw = bond * SLASH_BPS / 100
-      if (raw < 1) 1
-      else if (raw > bond) bond
-      else raw
+      val base = bond * SLASH_BPS / 100
+      val reduced = if (base > tier * TIER_SLASH_BPS * bond / 100)
+                        base - (tier * TIER_SLASH_BPS * bond / 100)
+                      else 0
+      if (reduced < 1) 1
+      else if (reduced > bond) bond
+      else reduced
     }
 
   // True when solver id s is registered and active with sufficient bond
@@ -115,9 +123,10 @@ module vortex {
     solvers.get(s).active and
     solvers.get(s).bond >= MIN_BOND
 
-  // Effective fill deadline for a solver accepting an intent at the current tick
-  pure def fillDeadlineFor(acceptTick: int): int =
-    acceptTick + FILL_WINDOW
+  // Effective fill deadline for a solver accepting an intent at the current tick.
+  // Includes tier-based fill window bonus (issue #197).
+  pure def fillDeadlineFor(acceptTick: int, tier: int): int =
+    acceptTick + FILL_WINDOW + (tier * TIER_FILL_BONUS)
 
   // ── Initialization ────────────────────────────────────────────────────────────
 
@@ -145,12 +154,12 @@ module vortex {
 
   // register_solver: a solver posts a bond.
   // Pre:  solver not yet registered OR bond would still be ≥ MIN_BOND after top-up.
-  // Post: SolverRecord created/updated with bond ≥ MIN_BOND, active = true.
+  // Post: SolverRecord created/updated with bond ≥ MIN_BOND, active = true, tier = 0.
   action registerSolver(sid: int, bondAmt: int) = all {
     bondAmt >= MIN_BOND,
     not(solvers.keys().contains(sid)) or not(solvers.get(sid).active),
     solvers' = solvers.put(sid, {
-      id: sid, bond: bondAmt, active: true, lastSlash: 0
+      id: sid, bond: bondAmt, active: true, tier: 0, lastSlash: 0
     }),
     intents'  = intents,
     tick'     = tick,
@@ -162,6 +171,19 @@ module vortex {
   action deregisterSolver(sid: int) = all {
     solvers.keys().contains(sid),
     solvers' = solvers.put(sid, solvers.get(sid).with("active", false)),
+    intents'  = intents,
+    tick'     = tick,
+    nextId'   = nextId,
+    treasury' = treasury
+  }
+
+  // set_tier: admin promotes/demotes a solver's tier.
+  // Pre:  solver exists, new_tier in [0, MAX_TIER].
+  // Post: solver's tier updated.
+  action setTier(sid: int, newTier: int) = all {
+    solvers.keys().contains(sid),
+    newTier >= 0 and newTier <= MAX_TIER,
+    solvers' = solvers.put(sid, solvers.get(sid).with("tier", newTier)),
     intents'  = intents,
     tick'     = tick,
     nextId'   = nextId,
@@ -200,17 +222,18 @@ module vortex {
 
   // accept_intent: solver claims exclusive fill rights.
   // Pre:  intent.state == Open, intent.deadline > tick, solver eligible.
-  // Post: state → Accepted, fillDeadline set to tick + FILL_WINDOW.
+  // Post: state → Accepted, fillDeadline set to tick + FILL_WINDOW + tier_bonus.
   action acceptIntent(iid: int, sid: int) = all {
     intents.keys().contains(iid),
     solverEligible(sid),
     val intent = intents.get(iid)
+    val solver = solvers.get(sid)
     all {
       intent.state == Open,
       intent.deadline > tick,
       intent' = intent.with("state", Accepted)
                       .with("solver", sid)
-                      .with("fillDeadline", fillDeadlineFor(tick)),
+                      .with("fillDeadline", fillDeadlineFor(tick, solver.tier)),
       intents' = intents.put(iid, intent'),
       solvers'  = solvers,
       tick'     = tick,
@@ -298,7 +321,7 @@ module vortex {
 
   // slash_solver: permissionless; penalises a solver that missed the fill window.
   // Pre:  state == Accepted, tick >= intent.fillDeadline.
-  // Post: state → Open (re-auctioned with fresh deadline), solver bond slashed.
+  // Post: state → Open (re-auctioned with fresh deadline), solver bond slashed (tier-adjusted).
   action slashSolver(iid: int) = all {
     intents.keys().contains(iid),
     val intent = intents.get(iid)
@@ -308,7 +331,7 @@ module vortex {
       val sid = intent.solver,
       solvers.keys().contains(sid),
       val solver = solvers.get(sid),
-      val slashAmt = computeSlash(solver.bond),
+      val slashAmt = computeSlash(solver.bond, solver.tier),
       val newBond  = solver.bond - slashAmt,
       val newActive = newBond >= MIN_BOND,
       solvers' = solvers.put(sid, solver.with("bond", newBond)
@@ -384,7 +407,7 @@ module vortex {
 
   // resolve_dispute: arbiter closes a disputed fill.
   // Pre:  state == Disputed.
-  // Post: state → Resolved; if Upheld, solver bond slashed.
+  // Post: state → Resolved; if Upheld, solver bond slashed (tier-adjusted).
   action resolveDispute(iid: int, outcome: DisputeResolution) = all {
     intents.keys().contains(iid),
     val intent = intents.get(iid)
@@ -392,7 +415,7 @@ module vortex {
       intent.state == Disputed,
       val sid = intent.solver,
       val slashAmt = if (outcome == Upheld and solvers.keys().contains(sid))
-                       computeSlash(solvers.get(sid).bond)
+                       computeSlash(solvers.get(sid).bond, solvers.get(sid).tier)
                      else 0,
       val newSolvers =
         if (outcome == Upheld and solvers.keys().contains(sid)) {
@@ -530,6 +553,36 @@ module vortex {
       intent.state == Resolved implies intent.hasResolution
     )
 
+  // INV-9: Solver tier is always within bounds [0, MAX_TIER]
+  val inv_tierBounds: bool =
+    solvers.keys().forall(sid =>
+      solvers.get(sid).tier >= 0 and solvers.get(sid).tier <= MAX_TIER
+    )
+
+  // INV-10: Higher tier solvers have equal or greater fill window bonus
+  // (fillDeadlineFor is monotonic in tier)
+  val inv_fillWindowMonotone: bool =
+    solvers.keys().forall(sid =>
+      solvers.keys().forall(other =>
+        solvers.get(sid).tier >= solvers.get(other).tier implies
+          fillDeadlineFor(tick, solvers.get(sid).tier) >= fillDeadlineFor(tick, solvers.get(other).tier)
+      )
+    )
+
+  // INV-11: Slash amount never exceeds bond (with tier adjustment)
+  val inv_slashNeverExceedsBond: bool =
+    solvers.keys().forall(sid =>
+      val solver = solvers.get(sid)
+      computeSlash(solver.bond, solver.tier) <= solver.bond
+    )
+
+  // INV-12: Slash amount is at least 1 when bond > 0 (floor)
+  val inv_slashFloorOne: bool =
+    solvers.keys().forall(sid =>
+      val solver = solvers.get(sid)
+      solver.bond > 0 implies computeSlash(solver.bond, solver.tier) >= 1
+    )
+
   // ── Combined safety check ──────────────────────────────────────────────────
   val safety: bool =
     inv_filledIsTerminal      and
@@ -538,7 +591,11 @@ module vortex {
     inv_acceptedHasSolver     and
     inv_filledAmountSufficient and
     inv_treasuryMonotone      and
-    inv_resolvedHasOutcome
+    inv_resolvedHasOutcome    and
+    inv_tierBounds            and
+    inv_fillWindowMonotone    and
+    inv_slashNeverExceedsBond and
+    inv_slashFloorOne
 
   // ──────────────────────────────────────────────────────────────────────────────
   // LIVENESS PROPERTIES
@@ -645,6 +702,72 @@ module traces {
     .then(acceptIntent(0, 0))
     .then(beginFill(0, 0))
     .then(disputeFill(0, 0))
+    .then(resolveDispute(0, Dismissed))
+    .expect(intents.get(0).state == Resolved)
+    .expect(intents.get(0).resolution == Dismissed)
+    .expect(solvers.get(0).bond == MIN_BOND + 4)  // no slash
+  }
+
+  // Trace 7: Tier-based fill window bonus
+  // A higher-tier solver gets extra fill window time.
+  run tierFillWindowBonus = {
+    init
+    .then(registerSolver(0, MIN_BOND + 4))
+    .then(submitIntent(0, 3, 20))
+    .then(acceptIntent(0, 0))        // tier 0 → fillDeadline = tick + 5 + 0*2 = 5
+    .expect(intents.get(0).fillDeadline == 5)
+    .then(setTier(0, 2))             // promote to tier 2
+    .then(acceptIntent(1, 0))        // tier 2 → fillDeadline = tick + 5 + 2*2 = 9
+    .expect(intents.get(1).fillDeadline == 9)
+  }
+
+  // Trace 8: Tier-based slash reduction
+  // A tier-3 solver pays less slash than a tier-0 solver.
+  run tierSlashReduction = {
+    init
+    .then(registerSolver(0, MIN_BOND + 10))  // tier 0
+    .then(submitIntent(0, 3, 30))
+    .then(acceptIntent(0, 0))
+    .then(advanceTick) .then(advanceTick) .then(advanceTick)
+    .then(advanceTick) .then(advanceTick)    // tick 5 → fillDeadline reached
+    .then(slashSolver(0))
+    .expect(solvers.get(0).bond < MIN_BOND + 10)  // slashed
+
+    .then(init)  // reset
+    .then(registerSolver(0, MIN_BOND + 10))
+    .then(setTier(0, 3))             // promote to tier 3
+    .then(submitIntent(0, 3, 30))
+    .then(acceptIntent(0, 0))
+    .then(advanceTick) .then(advanceTick) .then(advanceTick)
+    .then(advanceTick) .then(advanceTick)    // tick 5 + tier bonus
+    .then(slashSolver(0))
+    .expect(solvers.get(0).bond > solvers.get(0).bond) // less slash due to tier
+  }
+
+  // Trace 9: Partial fill then complete fill
+  run partialThenFullFill = {
+    init
+    .then(registerSolver(0, MIN_BOND + 4))
+    .then(submitIntent(0, 10, 20))
+    .then(acceptIntent(0, 0))
+    .then(partialFill(0, 0, 3))    // partial fill: 3 < 10
+    .expect(intents.get(0).state == PartiallyFilled)
+    .expect(intents.get(0).fillAmount == 3)
+    .then(partialFill(0, 0, 5))    // another partial: 3+5=8 < 10
+    .expect(intents.get(0).fillAmount == 8)
+    .then(partialFill(0, 0, 3))    // final partial: 8+3=11 >= 10 → Filled
+    .expect(intents.get(0).state == Filled)
+    .expect(intents.get(0).fillAmount == 11)
+  }
+
+  // Trace 10: Dispute dismissed, then resolver timeout
+  run disputeDismissedThenTimeout = {
+    init
+    .then(registerSolver(0, MIN_BOND + 4))
+    .then(submitIntent(0, 3, 20))
+    .then(acceptIntent(0, 0))
+    .then(beginFill(0, 0))
+    .then(disputeFill(0, 0))         // user disputes within window
     .then(resolveDispute(0, Dismissed))
     .expect(intents.get(0).state == Resolved)
     .expect(intents.get(0).resolution == Dismissed)

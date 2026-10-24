@@ -4,6 +4,28 @@ use soroban_sdk::{
 };
 use vortex_common::require_admin;
 
+//! Stake-weighted Governor for protocol parameter changes.
+//!
+//! Voting power is derived from solver bond plus delegated stake recorded in
+//! `solver_registry` checkpoints. Power is snapshotted at proposal creation so
+//! stake acquired after the snapshot cannot influence an in-flight vote
+//! (anti-flash-stake). Passed proposals are queued into the
+//! `TimelockController` and executed after the timelock delay.
+//!
+//! ## Voting power source (v1)
+//!
+//! The governor maintains its own checkpoint history per account, fed by an
+//! explicit `sync_power` call. `sync_power` reads the account's current bond
+//! from `solver_registry` (the v1 source of truth) and appends a `Checkpoint`
+//! at the current ledger. This keeps the governor self-contained (no
+//! cross-contract read at vote time) while still deriving power from the
+//! registry's bond data.
+//!
+//! Delegation (bond + delegated stake) is a documented follow-up and is out of
+//! scope for v1: only the account's own bond contributes to its power.
+
+#![no_std]
+
 /// Number of checkpoints retained per account. Bounded so binary search over
 /// the checkpoint history stays cheap and storage stays predictable.
 pub const MAX_CHECKPOINTS: u32 = 64;
@@ -98,12 +120,14 @@ pub enum GovernorError {
     AlreadyExecuted = 13,
     ProposalCanceled = 14,
     SelfTargetForbidden = 15,
-    InvalidVotingDelay = 16,
-    InvalidVotingPeriod = 17,
-    InvalidProposalThreshold = 18,
-    InvalidQuorum = 19,
-    Unauthorized = 20,
-    NotAuthorized = 21,
+    VoteTallyOverflow = 16,
+    DeadlineOverflow = 17,
+    InvalidVotingDelay = 18,
+    InvalidVotingPeriod = 19,
+    InvalidProposalThreshold = 20,
+    InvalidQuorum = 21,
+    Unauthorized = 22,
+    NotAuthorized = 23,
 }
 
 #[contracttype]
@@ -130,13 +154,23 @@ pub struct Governor;
 #[contractimpl]
 impl Governor {
     /// One-time configuration of the governor.
-    pub fn initialize(env: Env, config: GovernorConfig) -> Result<(), GovernorError> {
+    ///
+    /// `admin` must authorize the call, so a freshly-deployed governor cannot
+    /// be front-run and configured by an arbitrary party. The `admin` address
+    /// is recorded so the deployment authority is auditable on-chain.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        config: GovernorConfig,
+    ) -> Result<(), GovernorError> {
+        admin.require_auth();
         let key = Symbol::new(&env, "config");
         if env.storage().instance().has(&key) {
             return Err(GovernorError::AlreadyInitialized);
         }
         Self::validate_config(&config)?;
         env.storage().instance().set(&key, &config);
+        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
         env.storage().instance().set(&Symbol::new(&env, "count"), &0u32);
         env.events().publish(
             (symbol_short!("init"),),
@@ -227,7 +261,7 @@ impl Governor {
         let proposal = Proposal {
             proposer,
             snapshot,
-            deadline: snapshot + config.voting_delay + config.voting_period,
+            deadline: Self::deadline(&env, snapshot, &config)?,
             eta: 0,
             for_votes: 0,
             against_votes: 0,
@@ -296,7 +330,11 @@ impl Governor {
             return Err(GovernorError::ProposalCanceled);
         }
         let now = env.ledger().sequence();
-        if now < proposal.snapshot + config.voting_delay {
+        let voting_start = proposal
+            .snapshot
+            .checked_add(config.voting_delay)
+            .ok_or(GovernorError::DeadlineOverflow)?;
+        if now < voting_start {
             return Err(GovernorError::NotActive);
         }
         if now > proposal.deadline {
@@ -314,9 +352,24 @@ impl Governor {
         }
 
         match support {
-            VoteType::For => proposal.for_votes += power,
-            VoteType::Against => proposal.against_votes += power,
-            VoteType::Abstain => proposal.abstain_votes += power,
+            VoteType::For => {
+                proposal.for_votes = proposal
+                    .for_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
+            VoteType::Against => {
+                proposal.against_votes = proposal
+                    .against_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
+            VoteType::Abstain => {
+                proposal.abstain_votes = proposal
+                    .abstain_votes
+                    .checked_add(power)
+                    .ok_or(GovernorError::VoteTallyOverflow)?;
+            }
         }
         env.storage().persistent().set(&vote_key, &power);
         Self::bump_persistent_ttl(&env, &vote_key);
@@ -615,6 +668,15 @@ impl Governor {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+    }
+
+    /// Compute a proposal's deadline, guarding against ledger overflow.
+    fn deadline(env: &Env, snapshot: u32, config: &GovernorConfig) -> Result<u32, GovernorError> {
+        let _ = env;
+        snapshot
+            .checked_add(config.voting_delay)
+            .and_then(|v| v.checked_add(config.voting_period))
+            .ok_or(GovernorError::DeadlineOverflow)
     }
 
     fn proposal_key(env: &Env, proposal_id: u32) -> (Symbol, u32) {
