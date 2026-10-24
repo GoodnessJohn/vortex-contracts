@@ -1,3 +1,25 @@
+# Vortex Contracts — Makefile
+#
+# Wraps the commands documented in README.md so contributors never need to
+# copy-paste raw multi-flag invocations.  All targets run inside the
+# intent_settlement workspace directory.
+#
+# Usage:
+#   make          — print help
+#   make all      — fmt + lint + test + build (full pre-push check)
+#   make fmt      — format all source files
+#   make lint     — clippy with -D warnings (identical to CI)
+#   make test     — run unit / integration tests
+#   make build    — compile the release wasm binary
+#   make deploy-testnet — deploy to Stellar testnet (requires STELLAR_SOURCE)
+#
+# Proof Registry targets (issue #213):
+#   make proof-registry-fmt      — format proof_registry source
+#   make proof-registry-lint     — clippy proof_registry
+#   make proof-registry-test     — test proof_registry
+#   make proof-registry-build    — build proof_registry wasm
+#   make proof-registry-all      — full check for proof_registry
+
 .PHONY: build-wasms integration-test
 
 build-wasms:
@@ -7,8 +29,10 @@ build-wasms:
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 WORKSPACE       := intent_settlement
+PROOF_REGISTRY  := proof_registry
 WASM_TARGET     := wasm32-unknown-unknown
 WASM_OUT        := $(WORKSPACE)/target/$(WASM_TARGET)/release/vortex_intent_settlement.wasm
+PR_WASM_OUT     := $(PROOF_REGISTRY)/target/$(WASM_TARGET)/release/vortex_proof_registry.wasm
 STELLAR_NETWORK ?= testnet
 # Set STELLAR_SOURCE to your secret key or key-name before running deploy-testnet
 STELLAR_SOURCE  ?=
@@ -18,7 +42,10 @@ STELLAR_SOURCE  ?=
 .PHONY: all
 all: fmt lint test build  ## Run fmt, lint, test, and build (full pre-push check)
 
-# ── Individual targets ────────────────────────────────────────────────────────
+.PHONY: proof-registry-all
+proof-registry-all: proof-registry-fmt proof-registry-lint proof-registry-test proof-registry-build  ## Full check for proof_registry
+
+# ── Individual targets (intent_settlement) ─────────────────────────────────────
 
 .PHONY: fmt
 fmt:  ## Format all source files with rustfmt
@@ -62,6 +89,36 @@ error-reference-check:  ## Verify README.md's Error Reference table matches the 
 clean:  ## Remove build artefacts
 	cd $(WORKSPACE) && cargo clean
 
+# ── Proof Registry targets (issue #213) ────────────────────────────────────────
+
+.PHONY: proof-registry-fmt
+proof-registry-fmt:  ## Format proof_registry source files
+	cd $(PROOF_REGISTRY) && cargo fmt --all
+
+.PHONY: proof-registry-fmt-check
+proof-registry-fmt-check:  ## Check proof_registry formatting without modifying
+	cd $(PROOF_REGISTRY) && cargo fmt --all -- --check
+
+.PHONY: proof-registry-lint
+proof-registry-lint:  ## Run clippy on proof_registry
+	cd $(PROOF_REGISTRY) && cargo clippy --all-targets -- -D warnings
+
+.PHONY: proof-registry-test
+proof-registry-test:  ## Run proof_registry test suite
+	cd $(PROOF_REGISTRY) && cargo test
+
+.PHONY: proof-registry-build
+proof-registry-build:  ## Build proof_registry release wasm
+	cd $(PROOF_REGISTRY) && cargo build --target $(WASM_TARGET) --release
+
+.PHONY: proof-registry-audit
+proof-registry-audit:  ## Run cargo-audit on proof_registry
+	cd $(PROOF_REGISTRY) && cargo audit
+
+.PHONY: proof-registry-clean
+proof-registry-clean:  ## Remove proof_registry build artefacts
+	cd $(PROOF_REGISTRY) && cargo clean
+
 # ── Deploy ────────────────────────────────────────────────────────────────────
 
 .PHONY: deploy-testnet
@@ -102,7 +159,7 @@ local-network-status:  ## Check local network status
 integration-test: build-wasms  ## Run the integration test suite against freshly built wasms
 	cargo test -p integration-tests
 
-# ── Kani model checking (issue #415) ────────────────────────────────────────
+# ── Kani model checking (issue #415) ─────────────────────────────────────────
 
 .PHONY: kani
 kani:  ## Run Kani proof harnesses for pure arithmetic helpers (requires kani-verifier)

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **On-chain rate-of-change guardrails for protocol parameters (issue #561).**
+  `set_config` now rejects any single-call change to a rate-sensitive parameter
+  (`protocol_fee_bps`, `min_bond`, `fill_window`, `intent_expiry`) that exceeds a
+  hardcoded maximum per-call delta, returning a dedicated `Error::RateOfChangeExceeded`.
+  The guardrail composes with — and does not replace — the existing 48-hour
+  governance timelock: both a magnitude cap and a notice window apply. Limits are
+  hardcoded and documented for v1; making them governance-configurable is out of
+  scope.
+
 - **Generated "Error Reference" table in `README.md` (issue #531).**
   `scripts/generate-error-reference.py` parses the `Error` enum out of
   `intent_settlement/src/lib.rs` and renders a row for **every** declaration

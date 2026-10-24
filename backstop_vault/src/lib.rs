@@ -129,6 +129,7 @@ pub enum Error {
     EmergencyModeNotActive = 10,
     NothingQueued = 11,
     InvalidConfig = 12,
+    ProtectedToken = 13,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -485,6 +486,46 @@ impl BackstopVault {
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
+
+    /// Admin-only: recover non-bond tokens accidentally sent directly to the
+    /// vault contract address.
+    ///
+    /// Explicitly refuses to move the vault's own `bond_token` so this cannot
+    /// be misused to drain real LP deposits. Does not touch `TotalAssets` /
+    /// `TotalShares` since rescued tokens are not part of bond-token accounting.
+    pub fn rescue_tokens(env: Env, token: Address, amount: i128, recipient: Address) {
+        Self::bump_instance_ttl(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+
+        let bond_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::BondToken)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        if token == bond_token {
+            panic_with_error!(&env, Error::ProtectedToken);
+        }
+
+        if amount <= 0 {
+            panic_with_error!(&env, Error::ZeroAmount);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "rescue_tokens"), token, recipient),
+            amount,
+        );
+    }
 
     /// Admin-only: toggle emergency withdrawal-queue mode.
     /// When enabled, `withdraw` queues redemptions instead of paying
