@@ -1,13 +1,3 @@
-//! Stake-weighted Governor for protocol parameter changes.
-//!
-//! Voting power is derived from solver bond plus delegated stake recorded in
-//! `solver_registry` checkpoints. Power is snapshotted at proposal creation so
-//! stake acquired after the snapshot cannot influence an in-flight vote
-//! (anti-flash-stake). Passed proposals are queued into the
-//! `TimelockController` and executed after the timelock delay.
-
-#![no_std]
-
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Val, Vec};
 use vortex_common::require_admin;
 
