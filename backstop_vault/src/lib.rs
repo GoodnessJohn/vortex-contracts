@@ -46,6 +46,12 @@ const MIN_DEPOSIT: i128 = 10_000_000;
 /// a known incoming fee or slash payment.
 const WITHDRAWAL_COOLDOWN_SECS: u64 = 172_800; // 48 hours
 
+/// A top-up only (re)starts the withdrawal cooldown when it is at least this
+/// fraction (in basis points) of the LP's existing position value. Smaller
+/// top-ups leave an already-eligible balance's cooldown untouched. See the
+/// comment in `deposit` for the rationale and tradeoff.
+const COOLDOWN_RESET_FRACTION_BPS: i128 = 1_000; // 10%
+
 const DAY_IN_LEDGERS: u32 = 17_280; // ~5 s per ledger
 const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 14;
 const PERSISTENT_TTL_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
@@ -101,7 +107,11 @@ pub enum Error {
     EmergencyModeActive = 9,
     EmergencyModeNotActive = 10,
     NothingQueued = 11,
-    ProtectedToken = 12,
+    /// Checked arithmetic overflowed in a share/asset conversion. We fail
+    /// closed rather than silently substituting a fallback value.
+    ArithmeticOverflow = 12,
+    /// `rescue_tokens` was asked to move the vault's own bond token.
+    ProtectedToken = 13,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -159,12 +169,14 @@ impl BackstopVault {
         let total_shares = Self::load_total_shares(&env);
 
         // shares_minted = amount * total_shares / total_assets
-        // Virtual entries guarantee total_assets > 0 always.
+        // Virtual entries guarantee total_assets > 0 always. Any overflow in
+        // the intermediate product or a zero divisor fails closed with a
+        // dedicated error instead of silently substituting a wrong value.
         let shares_minted = amount
             .checked_mul(total_shares)
-            .unwrap_or(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
             .checked_div(total_assets)
-            .unwrap_or(1)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
             .max(1);
 
         // Transfer bond_token from LP to vault.
@@ -189,12 +201,52 @@ impl BackstopVault {
             .set(&DataKey::TotalAssets, &(total_assets + amount));
         Self::bump_persistent_ttl(&env, &DataKey::Shares(lp.clone()));
 
-        // Reset cooldown: fresh deposit starts a new window.
-        let cooldown_until = env.ledger().timestamp() + WITHDRAWAL_COOLDOWN_SECS;
-        env.storage()
-            .persistent()
-            .set(&DataKey::WithdrawCooldown(lp.clone()), &cooldown_until);
-        Self::bump_persistent_ttl(&env, &DataKey::WithdrawCooldown(lp.clone()));
+        // Cooldown scoping (Issue #485).
+        //
+        // The cooldown exists to stop deposit front-running of a known
+        // incoming fee/slash payment. Applying a full 48h reset to an LP's
+        // *entire* pre-existing balance on any top-up is disproportionate and
+        // discourages topping up. We therefore only (re)start the cooldown
+        // when the deposit is "significant" relative to the LP's existing
+        // position:
+        //
+        //   - an LP with no existing position always starts a cooldown;
+        //   - otherwise the cooldown is reset only when the new deposit is at
+        //     least `COOLDOWN_RESET_FRACTION_BPS` (10%) of the LP's existing
+        //     position value (measured in assets, using the pre-deposit
+        //     exchange rate). Smaller top-ups leave the existing cooldown
+        //     untouched, so an already-eligible balance stays eligible.
+        //
+        // Tradeoff: we deliberately avoid a full per-tranche ledger (which
+        // would be disproportionate complexity for this goal). The cost is
+        // that a dust top-up inherits the existing position's cooldown state
+        // rather than getting its own fresh window; the front-running window
+        // for the new increment is bounded by the existing position's
+        // cooldown, which is acceptable given the small size of such top-ups.
+        let existing_position_assets = if total_shares > 0 {
+            lp_shares
+                .checked_mul(total_assets)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
+                .checked_div(total_shares)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
+        } else {
+            0
+        };
+        let significant_deposit = existing_position_assets <= 0
+            || amount
+                .checked_mul(10_000)
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
+                >= existing_position_assets
+                    .checked_mul(COOLDOWN_RESET_FRACTION_BPS)
+                    .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow));
+
+        if significant_deposit {
+            let cooldown_until = env.ledger().timestamp() + WITHDRAWAL_COOLDOWN_SECS;
+            env.storage()
+                .persistent()
+                .set(&DataKey::WithdrawCooldown(lp.clone()), &cooldown_until);
+            Self::bump_persistent_ttl(&env, &DataKey::WithdrawCooldown(lp.clone()));
+        }
 
         env.events().publish(
             (Symbol::new(&env, "deposit"), lp),
@@ -242,11 +294,13 @@ impl BackstopVault {
         let total_shares = Self::load_total_shares(&env);
 
         // assets_out = shares * total_assets / total_shares
+        // Fail closed on overflow (or a zero divisor) rather than silently
+        // substituting a wrong value.
         let assets_out = shares
             .checked_mul(total_assets)
-            .unwrap_or(shares)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
             .checked_div(total_shares)
-            .unwrap_or(0)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow))
             .max(0);
 
         // Emergency mode: queue the withdrawal, burn shares immediately.

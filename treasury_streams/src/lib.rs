@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env, Vec,
+};
 
 /// Storage keys for the treasury streams contract.
 #[contracttype]
@@ -14,6 +16,12 @@ pub enum DataKey {
     NextId,
     /// Per-stream record.
     Stream(u64),
+    /// Total number of streams ever created.
+    StreamCount,
+    /// Ids of streams created by a given sender.
+    SenderStreams(Address),
+    /// Ids of streams created for a given recipient.
+    RecipientStreams(Address),
     /// Circuit-breaker flag gating `create_stream` and `withdraw`.
     Paused,
 }
@@ -65,7 +73,8 @@ pub enum Error {
     InvalidAmount = 6,
     NothingToWithdraw = 7,
     AlreadyCancelled = 8,
-    NoPendingGovernor = 9,
+    ArithmeticOverflow = 9,
+    NoPendingGovernor = 12,
     Paused = 10,
     NotPaused = 11,
 }
@@ -194,6 +203,28 @@ impl TreasuryStreams {
         };
         env.storage().persistent().set(&DataKey::Stream(id), &stream);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
+
+        // Maintain enumeration indexes for paginated views.
+        let count: u64 = env.storage().instance().get(&DataKey::StreamCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::StreamCount, &(count + 1));
+
+        let sender_key = DataKey::SenderStreams(sender.clone());
+        let mut sender_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&sender_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        sender_ids.push_back(id);
+        env.storage().persistent().set(&sender_key, &sender_ids);
+
+        let recipient_key = DataKey::RecipientStreams(recipient.clone());
+        let mut recipient_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&recipient_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        recipient_ids.push_back(id);
+        env.storage().persistent().set(&recipient_key, &recipient_ids);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("create"), id),
@@ -378,6 +409,55 @@ impl TreasuryStreams {
             .ok_or(Error::StreamNotFound)
     }
 
+    /// Returns the total number of streams ever created.
+    pub fn get_stream_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::StreamCount).unwrap_or(0)
+    }
+
+    /// Returns a page of stream ids created by `sender`, starting at `start`
+    /// with at most `limit` entries. Out-of-range `start` yields an empty page.
+    pub fn list_streams_by_sender(env: Env, sender: Address, start: u32, limit: u32) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SenderStreams(sender))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate(&env, &ids, start, limit)
+    }
+
+    /// Returns a page of stream ids created for `recipient`, starting at
+    /// `start` with at most `limit` entries. Out-of-range `start` yields an
+    /// empty page.
+    pub fn list_streams_by_recipient(
+        env: Env,
+        recipient: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<u64> {
+        let ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecipientStreams(recipient))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::paginate(&env, &ids, start, limit)
+    }
+
+    /// Slices `ids` into a page of at most `limit` entries beginning at `start`.
+    fn paginate(env: &Env, ids: &Vec<u64>, start: u32, limit: u32) -> Vec<u64> {
+        let mut page = Vec::new(env);
+        let len = ids.len();
+        if start >= len || limit == 0 {
+            return page;
+        }
+        let end = core::cmp::min(start.saturating_add(limit), len);
+        let mut i = start;
+        while i < end {
+            page.push_back(ids.get_unchecked(i));
+            i += 1;
+        }
+        page
+    }
+
     /// Loads the governor and requires its authorization.
     fn require_governor(env: &Env) -> Result<Address, Error> {
         let governor: Address = env
@@ -401,7 +481,14 @@ impl TreasuryStreams {
         }
         let duration = (stream.end - stream.start) as i128;
         let elapsed = (now - stream.start) as i128;
-        stream.total * elapsed / duration
+        match stream
+            .total
+            .checked_mul(elapsed)
+            .and_then(|n| n.checked_div(duration))
+        {
+            Some(vested) => vested,
+            None => panic_with_error!(&Env::default(), Error::ArithmeticOverflow),
+        }
     }
 }
 
