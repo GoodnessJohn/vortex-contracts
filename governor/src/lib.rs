@@ -4,6 +4,28 @@ use soroban_sdk::{
 };
 use vortex_common::require_admin;
 
+//! Stake-weighted Governor for protocol parameter changes.
+//!
+//! Voting power is derived from solver bond plus delegated stake recorded in
+//! `solver_registry` checkpoints. Power is snapshotted at proposal creation so
+//! stake acquired after the snapshot cannot influence an in-flight vote
+//! (anti-flash-stake). Passed proposals are queued into the
+//! `TimelockController` and executed after the timelock delay.
+//!
+//! ## Voting power source (v1)
+//!
+//! The governor maintains its own checkpoint history per account, fed by an
+//! explicit `sync_power` call. `sync_power` reads the account's current bond
+//! from `solver_registry` (the v1 source of truth) and appends a `Checkpoint`
+//! at the current ledger. This keeps the governor self-contained (no
+//! cross-contract read at vote time) while still deriving power from the
+//! registry's bond data.
+//!
+//! Delegation (bond + delegated stake) is a documented follow-up and is out of
+//! scope for v1: only the account's own bond contributes to its power.
+
+#![no_std]
+
 /// Number of checkpoints retained per account. Bounded so binary search over
 /// the checkpoint history stays cheap and storage stays predictable.
 pub const MAX_CHECKPOINTS: u32 = 64;
